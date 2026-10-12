@@ -10,7 +10,7 @@
 
 当前 workflow 的 `HUNT_DIAGNOSTIC_LOCK: 'true'` 是固定代码门：定时触发和手动触发（即使未勾选 `diagnostic_only`）均只做安装/认证准备及只读 OCI 检查，不 launch、不发送 Telegram、不禁用 workflow；生产 launch 入口另有诊断模式拒绝保护。锁缺失或不是精确字符串 `false` 时仍保持诊断。手动 `diagnostic_only: true` 在解除锁后也可单次只读运行。诊断仍需现有必填 Secrets、内置 GitHub 上下文及 IAM 查询权限；不要把真实值放进运行输入或日志。
 
-下一次人工诊断：先保持旧 workflow 禁用，确认默认分支已包含该固定锁，再由人工启用并手动运行；定时抢先触发也只读。日志仅提供固定 `stage`、白名单 `category`、经校验的 `http` 数字或 `none`。阶段包括 credentials、cli_install、region_subscription、availability_domains、subnet、compartments、other_instances、block_volumes、boot_volumes、image_arm/amd、image_compat_arm/amd、target_instances；不输出 CLI 原始响应、错误文本、参数、OCID 或凭据。诊断错误退出 1，所有检查完成退出 0，均不能证明真实创建或通知成功。
+下一次人工诊断：先保持旧 workflow 禁用，确认默认分支已包含该固定锁，再由人工启用并手动运行；定时抢先触发也只读。日志仅提供固定 `stage`、白名单 `category`、经校验的 `http` 数字或 `none`；只有 `stdout_empty` 类别会额外给出固定 `stderr_kind` 分类（例如已识别的 CLI 提示或 `unknown`），不输出 stderr 内容、动态路径、错误文本、参数、OCID 或凭据。阶段包括 credentials、cli_install、region_subscription、availability_domains、subnet、compartments、other_instances、block_volumes、boot_volumes、image_arm/amd、image_compat_arm/amd、target_instances。该分类仅帮助区分常见 CLI 输出，不改变失败关闭决策，也不能证明具体 Secret 有误。诊断错误退出 1，所有检查完成退出 0，均不能证明真实创建或通知成功。
 
 当前“Initial AD, image or safety discovery failed”只证明前置发现失败，不能推定 Secrets 有误或某个 CLI 参数无效。取得上述脱敏阶段/类别/HTTP 后再定位原因；不要求提供原始日志或凭据。诊断期间定时运行仍会执行只读检查；完成取证后人工禁用以停止重复检查。恢复普通抢建必须先禁用并等待已有诊断运行结束，核实诊断原因和下述免费额度/并发条件，再审核将固定锁改成 `'false'`，重跑离线验收后由人工发布和启用。未解除锁不得声称已恢复抢建；解除后 schedule 可能立即运行，应在启用前完成全部确认。本次未发布、启用或进行真实诊断。
 

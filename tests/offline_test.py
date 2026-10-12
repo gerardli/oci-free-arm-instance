@@ -693,6 +693,47 @@ class OfflineAcceptance(unittest.TestCase):
         self.assert_counts(mock, 0, 0, 0)
         self.assertIn('Diagnostic-only complete', output)
 
+    def test_16_empty_stdout_stderr_is_safely_classified(self):
+        file_permissions = (
+            f'WARNING: Permissions on /mock/{SENSITIVE}/.oci/config are too open.\n'
+            'To fix this please try executing the following command:\n'
+            f'oci setup repair-file-permissions --file /mock/{SENSITIVE}/.oci/config\n'
+            'Alternatively to hide this warning, you may set the environment variable, '
+            'OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING:\n'
+            'export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True'
+        )
+        cases = (
+            ('Query returned empty result, no output to show.', 'query_empty_result_warning'),
+            ('WARNING: This operation supports pagination and not all resources were returned. '
+             'Re-run using the --all option to auto paginate and list all resources.',
+             'pagination_warning'),
+            (file_permissions, 'file_permissions_warning'),
+            ('OCI warning: ' + SENSITIVE, 'unknown'),
+            ('Query returned empty result, no output to show.\n' + SENSITIVE, 'unknown'),
+        )
+        for stderr, expected_kind in cases:
+            with self.subTest(stderr_kind=expected_kind, mixed='\n' in stderr):
+                mock = MockCommands(overrides={
+                    'operation_failure': ('bv', 'volume', 'list'),
+                    'operation_outcome': subprocess.CompletedProcess([], 0, '', stderr),
+                })
+                status, output = run_case(mock, {'HUNT_DIAGNOSTIC_ONLY': 'true'})
+                self.assertEqual(status, 1)
+                self.assertIn('stage=block_volumes category=stdout_empty http=none '
+                              'stderr_kind=' + expected_kind, output)
+                self.assertNotIn(SENSITIVE, output)
+                self.assertNotIn('/mock/', output)
+                self.assert_counts(mock, 0, 0, 0)
+                self.assertNotIn('launch', mock.events)
+
+        namespace = {}
+        prefix = SOURCE.split("\ntry:\n    need(env.get('HUNT_DIAGNOSTIC_ONLY'", 1)[0]
+        with patch.dict(os.environ, {'HUNT_DIAGNOSTIC_LOCK': 'true'}, clear=True):
+            exec(compile(prefix, str(WORKFLOW), 'exec'), namespace)
+            self.assertEqual(namespace['classify_stderr'](' \n'), 'empty')
+            self.assertEqual(namespace['classify_stderr'](None), 'empty')
+            self.assertEqual(namespace['classify_stderr'](SENSITIVE), 'unknown')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

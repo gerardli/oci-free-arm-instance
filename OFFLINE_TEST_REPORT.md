@@ -192,3 +192,57 @@ exit "$result"
 审查保留两项风险。退出码 0 且完全空白无法与假想的静默失败区分，会按空库存继续，严重程度低，这是渲染契约本身的边界。若 `--all` 最后一页仍带 `opc-next-page` 或 `opc-total-items`，空列表会因没有 data 而失败关闭，可能拦住真实抢建，但不会因此重复创建；有效性风险为中，误创建风险为低。本轮没有新的原始响应可以排除第二种情况。
 
 四项真实环境事项仍为未验证。离线通过不表示已找到真实故障原文、已恢复抢建、通知已送达或费用为零。
+
+## 本轮：空 stdout 的固定 stderr 分类（2026-10-13）
+
+用户提供的诊断字段为 `stage=block_volumes category=stdout_empty http=none`；本轮没有读取真实运行日志、stderr 原文、凭据或账号配置。静态控制流显示，`listing()` 对 block volume list 添加 `--all`；如果该命令退出码为 0、stdout 与 stderr 都为空，解析器会按空列表处理。现在出现 `stdout_empty` 意味着 stdout 为空白而 stderr 含非空内容，流程按原规则失败关闭并在首次 launch 前停止。此前到达此阶段说明 Secrets 存在性检查、CLI 安装以及此前访问的 OCI 读取步骤已走过，但不能据此确认全部 Secret 有效；不同 OCI 资源的 IAM 权限仍可能不同，也不能仅从该字段确定 stderr 的具体原因。**此证据不支持“9 个必填 Secret 都填错”的结论。**
+
+生产脚本只为 `stdout_empty` 附加一个固定 `stderr_kind`：`query_empty_result_warning`、`pagination_warning`、`file_permissions_warning` 或 `unknown`。分类器只比较固定文本结构，不输出原始 stderr、动态路径或身份信息；非空白 stderr 仍然失败关闭，不按空列表处理，不改变通知、禁用、创建或复查逻辑。文件权限提示中的路径只用于模式匹配，不保留在诊断字段中。该信息只能区分常见 CLI 输出，`unknown` 仍不能定位根因。
+
+本轮修改前的四文件指纹沿用本会话记录：workflow `c6d70a8eecd5565c331944666b64f0201e4c4ab953b65addf898b91b8745fd66`、测试 `660990412161c030601213ae5cc8c0c4bfecdb1d4eb9c52599a9258304090b94`、README `faa277e2a8e23458f0f882efbde603440c9c4a6d28d4873f4e4446be41c31096`、本报告 `f39e973eb42d83bfabfabb14037e6b3d2efa09127eb4d8bca9a3d2218f6d8c1c`。四个目标文件均在原授权范围内。
+
+新增离线场景从当前 workflow heredoc 提取并执行生产脚本，在隔离 HOME、TMPDIR 和 `env -i` 虚构凭据环境中，模拟 block volume list 退出码 0、stdout 为空并分别返回两种固定 CLI 提示、文件权限提示、未知文本以及混合文本。断言实际阶段仍为 `block_volumes`，类别仍为 `stdout_empty`，敏感标记和动态路径均不出现在输出，且 launch、Telegram、disable 均为 0。未知 subprocess 命令继续由 mock 拒绝；测试未读取用户真实凭据或配置，也未安装依赖。
+
+实际命令与结果：
+
+```zsh
+task_tmp=$(mktemp -d /private/tmp/oci-diagnostic.XXXXXX)
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$task_tmp" TMPDIR="$task_tmp" /usr/bin/python3 -I tests/offline_test.py > "$task_tmp/runner.log" 2>&1
+result=$?
+/usr/bin/awk '/^Ran [0-9]+ tests? in / || /^OK$/ || /^FAILED / {print}' "$task_tmp/runner.log"
+printf 'exit_code=%s\n' "$result"
+rm -f "$task_tmp/runner.log" "$task_tmp/xcrun_db"
+rmdir "$task_tmp"
+exit "$result"
+```
+
+结果为 16 个测试方法通过，退出码 0。YAML 与 shell 检查的实际命令如下，精确核对 schedule、手动输入、permissions、concurrency、固定诊断锁，并把唯一 bash step 传给 `/bin/bash -n`：
+
+```sh
+env -i PATH=/usr/bin:/bin /usr/bin/ruby - <<'RB'
+require 'yaml'
+require 'open3'
+w = YAML.safe_load(File.read('.github/workflows/hunt-free-vm.yml'), aliases: false)
+t = w['on'] || w[true]
+checks = {}
+checks['triggers'] = t.keys.sort == ['schedule', 'workflow_dispatch']
+checks['schedule'] = t['schedule'] == [{'cron'=>'*/15 * * * *'}]
+checks['dispatch_input'] = t.dig('workflow_dispatch', 'inputs', 'diagnostic_only') == {'description'=>'Read-only OCI checks; never launch, notify or disable', 'type'=>'boolean', 'default'=>false}
+checks['permissions'] = w['permissions'] == {'actions'=>'write'}
+checks['concurrency'] = w['concurrency'] == {'group'=>'oracle-free-vm-hunt', 'cancel-in-progress'=>false}
+steps = w.fetch('jobs').fetch('hunt').fetch('steps')
+checks['step'] = steps.size == 1 && steps[0]['shell'] == 'bash'
+checks['diagnostic_lock'] = w.dig('jobs', 'hunt', 'env', 'HUNT_DIAGNOSTIC_LOCK') == 'true'
+_, err, status = Open3.capture3('/bin/bash', '-n', stdin_data: steps[0].fetch('run'))
+checks['bash_syntax'] = status.success? && err.empty?
+checks.each { |name, ok| puts "#{name}=#{ok ? 'PASS' : 'FAIL'}" }
+abort 'workflow check failed' unless checks.values.all?
+puts 'YAML structure and bash syntax: PASS'
+RB
+```
+
+检查退出码 0；未运行 actionlint。此前一次临时检查脚本错误地把 job-level 诊断锁当成 `run` 文本的一部分，造成检查器自身的一项断言失败；把断言改为读取 YAML 的 job env 后，完整结构与 shell 检查通过。该检查器错误没有运行 workflow 或触发外部调用。未调用真实 OCI、GitHub、Telegram API，没有创建资源、发布或触发 workflow。
+
+本轮主控原任务明确授权只查公开官方 CLI 源码，并要求优先使用 `ego-browser`、无法确认时归为 `unknown`。`ego-browser` 因 bootstrap 无法连接而不可用后，按该授权降级到 TinyFish，读取固定版本 `oci-cli 3.94.2` 的公开源码文件 [cli_util.py](https://raw.githubusercontent.com/oracle/oci-cli/v3.94.2/src/oci_cli/cli_util.py)。未访问账号 API、真实运行日志或凭据。公开源码支持空 `data` 且无可展示 header 时 stdout 可能为空的解释，但不能证明本次真实 stderr 内容或其类别。
+
+独立只读复核由未参与本轮修改的 `empty_list_review` 完成。审查者独立重跑隔离环境的 16 个测试方法，退出码 0；独立执行 Ruby YAML 结构/concurrency/诊断锁校验及 `/bin/bash -n`，退出码 0。复核确认分类器只输出固定白名单标签，stderr 非空仍为 `stdout_empty` 并失败关闭，`test_16` 使用当前 workflow heredoc 验证实际 `block_volumes` 阶段及零 launch/通知/禁用，没有发现实现阻塞项。检查范围有一处差异：本报告所列实现者 Ruby 命令精确比较了手动输入的 description、type、default；审查者独立运行的结构检查只比较 type 和 default。两者对其余结构、concurrency、诊断锁和 bash 语法的结果一致。审查者未改文件，也未联网、读取真实凭据或运行日志。

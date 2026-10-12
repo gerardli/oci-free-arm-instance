@@ -64,6 +64,9 @@ jobs:
           LIST_COMMANDS = {('iam', 'region-subscription', 'list'), ('iam', 'availability-domain', 'list'),
                            ('iam', 'compartment', 'list'), ('compute', 'instance', 'list'),
                            ('compute', 'image', 'list'), ('bv', 'volume', 'list'), ('bv', 'boot-volume', 'list')}
+          CLI_QUERY_EMPTY_RESULT_WARNING = 'Query returned empty result, no output to show.'
+          CLI_PAGINATION_WARNING = ('WARNING: This operation supports pagination and not all resources were returned. '
+                                    'Re-run using the --all option to auto paginate and list all resources.')
           started = time.monotonic()
           env = os.environ
           diagnostic_only = env.get('HUNT_DIAGNOSTIC_LOCK', 'true') != 'false' or env.get('HUNT_DIAGNOSTIC_ONLY', 'false') == 'true'
@@ -73,9 +76,30 @@ jobs:
               pass
 
           class OciError(Exception):
-              def __init__(self, status=None, code='', message='', category='cli_error'):
+              def __init__(self, status=None, code='', message='', category='cli_error', stderr_kind=None):
                   self.status = status if type(status) is int and 100 <= status <= 599 else None
                   self.code, self.message, self.category = code, message, category
+                  self.stderr_kind = stderr_kind
+
+          def classify_stderr(stderr):
+              # Return fixed labels only. stderr can contain paths, identities, or other sensitive data.
+              if not isinstance(stderr, str) or not stderr.strip():
+                  return 'empty'
+              output = stderr.strip()
+              if output == CLI_QUERY_EMPTY_RESULT_WARNING:
+                  return 'query_empty_result_warning'
+              if output == CLI_PAGINATION_WARNING:
+                  return 'pagination_warning'
+              lines = [line.strip() for line in output.splitlines() if line.strip()]
+              if (len(lines) == 5
+                      and re.fullmatch(r'WARNING: Permissions on .+ are too open\.', lines[0])
+                      and lines[1] == 'To fix this please try executing the following command:'
+                      and lines[2].startswith('oci setup repair-file-permissions --file ')
+                      and lines[3] == ('Alternatively to hide this warning, you may set the environment variable, '
+                                       'OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING:')
+                      and lines[4] == 'export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True'):
+                  return 'file_permissions_warning'
+              return 'unknown'
 
           def diagnostic_detail(error=None, category='validation_error'):
               # Only fixed labels and validated numeric HTTP status may leave this process.
@@ -89,7 +113,13 @@ jobs:
                          'stdout_empty', 'authentication', 'authorization', 'rate_limit', 'service_error',
                          'quota', 'runner_error', 'unknown_result'}
               category = category if category in allowed else 'cli_error'
-              return 'stage=' + stage + ' category=' + category + ' http=' + (str(status) if status else 'none')
+              detail = 'stage=' + stage + ' category=' + category + ' http=' + (str(status) if status else 'none')
+              if isinstance(error, OciError) and error.category == 'stdout_empty':
+                  allowed_stderr = {'empty', 'query_empty_result_warning', 'pagination_warning',
+                                    'file_permissions_warning', 'unknown'}
+                  stderr_kind = error.stderr_kind if error.stderr_kind in allowed_stderr else 'unknown'
+                  detail += ' stderr_kind=' + stderr_kind
+              return detail
 
           def operation_stage(args):
               operation = tuple(args[:3])
@@ -196,7 +226,7 @@ jobs:
               if not result.stdout.strip():
                   if (tuple(args[:3]) in LIST_COMMANDS and '--all' in args and not result.stderr.strip()):
                       return []
-                  raise OciError(category='stdout_empty')
+                  raise OciError(category='stdout_empty', stderr_kind=classify_stderr(result.stderr))
               try:
                   parsed = json.loads(result.stdout)
               except ValueError:
