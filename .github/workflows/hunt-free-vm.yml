@@ -60,6 +60,10 @@ jobs:
           ARM = 'VM.Standard.A1.Flex'
           AMD = 'VM.Standard.E2.1.Micro'
           VALID = {'PROVISIONING', 'RUNNING', 'STARTING', 'STOPPING', 'STOPPED', 'MOVING'}
+          # Only these fully paginated list commands can legitimately render an empty collection as blank stdout.
+          LIST_COMMANDS = {('iam', 'region-subscription', 'list'), ('iam', 'availability-domain', 'list'),
+                           ('iam', 'compartment', 'list'), ('compute', 'instance', 'list'),
+                           ('compute', 'image', 'list'), ('bv', 'volume', 'list'), ('bv', 'boot-volume', 'list')}
           started = time.monotonic()
           env = os.environ
           diagnostic_only = env.get('HUNT_DIAGNOSTIC_LOCK', 'true') != 'false' or env.get('HUNT_DIAGNOSTIC_ONLY', 'false') == 'true'
@@ -82,8 +86,8 @@ jobs:
                   if error.code == 'LimitExceeded':
                       category = 'quota'
               allowed = {'validation_error', 'cli_error', 'timeout', 'transport', 'invalid_response',
-                         'authentication', 'authorization', 'rate_limit', 'service_error', 'quota',
-                         'runner_error', 'unknown_result'}
+                         'stdout_empty', 'authentication', 'authorization', 'rate_limit', 'service_error',
+                         'quota', 'runner_error', 'unknown_result'}
               category = category if category in allowed else 'cli_error'
               return 'stage=' + stage + ' category=' + category + ' http=' + (str(status) if status else 'none')
 
@@ -186,10 +190,20 @@ jobs:
                       raise OciError(error.get('status'), error.get('code', ''), error.get('message', ''))
                   except (ValueError, AttributeError):
                       raise OciError(category='cli_error') from None
+              # oci-cli 3.94.2 render() adds data only when truthy, then prints only a non-empty
+              # display dictionary. A known list --all with exit 0 and blank stdout/stderr is [].
+              # get/launch, stderr, header-only JSON and every other body stay rejected.
+              if not result.stdout.strip():
+                  if (tuple(args[:3]) in LIST_COMMANDS and '--all' in args and not result.stderr.strip()):
+                      return []
+                  raise OciError(category='stdout_empty')
               try:
-                  return json.loads(result.stdout)['data']
-              except (ValueError, KeyError, TypeError):
+                  parsed = json.loads(result.stdout)
+              except ValueError:
                   raise OciError(category='invalid_response') from None
+              if not isinstance(parsed, dict) or 'data' not in parsed:
+                  raise OciError(category='invalid_response')
+              return parsed['data']
 
           def listing(*args):
               rows = oci(*args, '--all')

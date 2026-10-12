@@ -62,6 +62,7 @@
 ## 普通模式停止和异常规则（解除诊断锁后）
 
 - 每次创建前用 `oci compute instance list --all` 查指定 compartment，跨全部 AD，不按名称筛选。RUNNING、PROVISIONING、STARTING、STOPPING、STOPPED、MOVING、TERMINATING 都按非 TERMINATED 的已有目标实例处理：通知中包含实际 shape 和状态，说明目标已达成，然后禁用 workflow，不再创建。TERMINATED 可忽略；未知状态保守停止、告警并禁用。
+- OCI CLI 3.94.2 只在 `data` 为真时写入 JSON，展示字典为空则不打印。已知 list 命令同时满足 `--all`、退出码 0、stdout 和 stderr 仅空白时按空集合处理，显式 `{"data":[]}` 同样是空集合；这不把查询失败当成没有实例。get、launch、缺少 `--all` 的 list、stderr 非空、坏 JSON，以及只有 header、没有 data 的对象，一律拒绝。创建响应为空白时仍只复查一次，复查为空则告警并禁用，不再 launch。该规则来自已核对的 CLI 渲染契约，不是某次真实响应原文。
 - 所有 OCI 命令均包含 `--no-retry`；无 CLI 内部重试、等待器或自动退避。两次候选创建之间重新查询实例和整个 tenancy 的免费资源余量。库存为空不等于 API 提供原子锁。
 - 明确容量不足允许继续候选；全部无货时不打印业务消息、不发送 Telegram、不禁用，留待下一次定时运行。GitHub runner 自身仍有系统运行日志。
 - 初始目标实例查询明确 429 或创建明确 429：静默停轮、不禁用、不再创建或转 AMD。其他查询失败告警并禁用；初始 AD、镜像或安全盘点发现失败（包括 429）在创建前告警并禁用。认证、配额、配置和其他已知创建拒绝异常同样停止、告警并禁用；401/403 不复查。

@@ -148,3 +148,47 @@ exit "$result"
 本轮不新增状态文件、重试、依赖或盘点；保留上文列出的缓存、认证载体、额外 IAM/存储盘点等方案偏离。真实故障根因未验证；四项真实环境验证及真实诊断、通知送达、免费资格均未验证。离线成功不表示已部署、恢复抢建或保证零费用。
 
 本轮独立只读复核：进行中，待记录最终结论。
+
+## 本轮：空列表空白 stdout（2026-10-13）
+
+修改前四文件 SHA-256：
+
+| 文件 | 本轮修改前 SHA-256 |
+| --- | --- |
+| .github/workflows/hunt-free-vm.yml | a8ac2cbb6869fb6842ebdc7c066fe3329d9a67cb2cadbf3bea8de061eb11d7c4 |
+| tests/offline_test.py | d9fcdf8fb582c40d67248a3dfc4d6943bc9fdf4b72b001f38590f028a9ce4e11 |
+| README.md | 1b8218f841753f01b6f2d3addec7dd58e6ab637b75699d04ff32b2aa534b5ec8 |
+| OFFLINE_TEST_REPORT.md | c4ae435bdef11a952c01c61844b0c5da888aec03e4634b53eadad9ff707c164d |
+
+本轮未重新下载 OCI CLI 源码，也没有读取真实运行日志或 OCI 响应原文。修复依据此前已核对的 oci-cli 3.94.2 `render()` 契约：`data` 为假时不写入 data，展示字典为空时不打印 JSON。因此合法空列表且没有可展示 header 时，成功调用的 stdout 会是空白。这是代码契约缺陷，不是对线上原始 stdout 的直接取证。`DISPLAY_HEADERS` 包含 `opc-next-page` 和 `opc-total-items`；`--all` 聚合后的最后一页是否仍携带这些 header，本轮没有新的原始响应证据。只有 header、没有 data 的 JSON 继续拒绝。
+
+生产解析只在同时满足以下条件时返回空列表：命令属于已知 list、参数含 `--all`、退出码 0、stdout 与 stderr 去掉空白后都为空。get、launch、未分页 list、stderr 非空、坏 JSON 和其他形状一律拒绝，不把空白创建响应当作成功。创建响应空白仍走原有复查；复查得到空集合时告警并禁用，不再 launch。诊断锁仍是精确字符串 `true`。没有新增架构、依赖、重试或盘点。
+
+实现者先把 mock 改成按该契约渲染空列表（空白 stdout），在修改解析器前观察到 15 个方法中 60 个子断言失败、退出码 1。独立审查没有回退代码，因此没有复现这 60 个失败，不把它当作审查者已复核的证据。随后只修改解析器，并校正 launch 空白响应的断言：复查会把全局 stage 改成 target_instances，最终类别是 unknown_result，不是 launch 阶段的 stdout_empty。全量重跑命令：
+
+```zsh
+task_tmp=$(mktemp -d /private/tmp/oci-repair.XXXXXX)
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$task_tmp" TMPDIR="$task_tmp" /usr/bin/python3 -I tests/offline_test.py
+result=$?
+rm -rf "$task_tmp"
+exit "$result"
+```
+
+实现者本次结果：15 个方法、0.482 秒、退出码 0。耗时不是稳定指标。原五组及既有分支重新执行通过，不用本报告更早的 PASS 代替。另用系统 Ruby `YAML.safe_load` 和 `/bin/bash -n` 检查触发器、permissions、concurrency、诊断锁和 shell 语法，退出码 0。未运行 actionlint，未调用真实 OCI、GitHub 或 Telegram。
+
+| 本轮场景 | 关键断言与实际结果 |
+| --- | --- |
+| 正常路径上的空 list 按空白 stdout 渲染 | PASS：ARM 成功仍只创建一次；空白空列表响应次数大于 0 |
+| 显式 `{"data":[]}` 与仅空白的 stdout/stderr | PASS：目标查询按空集合继续，ARM 成功后停止 |
+| 目标 list 空白 stdout 但 stderr 含虚构敏感文本 | PASS：launch 0，类别 stdout_empty，敏感文本不出现 |
+| 只有 `opc-total-items`、没有 data | PASS：不创建，类别 invalid_response |
+| launch 空白 stdout | PASS：只 launch 一次，复查 3 次目标查询中的最后一次为空，unknown_result，预置的第二次 launch 未消费 |
+| 直接调用提取出的生产 `oci()` | PASS：volume list --all 空白返回 []；无 --all 的 instance list、launch、subnet get 均为 stdout_empty |
+| 镜像 get 空白 stdout | PASS：首次 launch 前停止，目标查询 0 次，阶段 image_arm |
+| 诊断锁开启且库存为空 | PASS：launch、通知、禁用均为 0，诊断完成 |
+
+独立审查者 empty_list_review 未参与修改，只读复核后重跑隔离环境下的 `/usr/bin/python3 -I tests/offline_test.py`：15 个方法、0.474 秒、退出码 0；Ruby `YAML.safe_load` 与 `/bin/bash -n` 退出码 0。审查结论为通过，与实现者没有代码结论分歧。审查者确认：空白 stdout 只有已知 list、带 `--all`、退出码 0 且 stdout/stderr 去空白后为空才返回空集合；get、launch 和未分页 list 不会因此继续创建；launch 空白只复查一次，空结果告警并禁用。审查者未改文件。
+
+审查保留两项风险。退出码 0 且完全空白无法与假想的静默失败区分，会按空库存继续，严重程度低，这是渲染契约本身的边界。若 `--all` 最后一页仍带 `opc-next-page` 或 `opc-total-items`，空列表会因没有 data 而失败关闭，可能拦住真实抢建，但不会因此重复创建；有效性风险为中，误创建风险为低。本轮没有新的原始响应可以排除第二种情况。
+
+四项真实环境事项仍为未验证。离线通过不表示已找到真实故障原文、已恢复抢建、通知已送达或费用为零。

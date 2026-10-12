@@ -51,6 +51,7 @@ class MockCommands:
         self.disables = []
         self.secret_files = []
         self.target_queries = 0
+        self.blank_list_responses = 0
         self.events = []
         self.unexpected = []
 
@@ -208,7 +209,13 @@ class MockCommands:
         else:
             self.unexpected.append(operation)
             raise AssertionError('Unmocked OCI operation')
-        return subprocess.CompletedProcess(command, 0, json.dumps({'data': data}), '')
+        # oci-cli 3.94.2 render() emits no JSON when data is falsy and no display header remains.
+        if isinstance(data, list) and not data:
+            self.blank_list_responses += 1
+            rendered = ''
+        else:
+            rendered = json.dumps({'data': data})
+        return subprocess.CompletedProcess(command, 0, rendered, '')
 
     @staticmethod
     def assert_capture(kwargs):
@@ -612,6 +619,79 @@ class OfflineAcceptance(unittest.TestCase):
             mock = MockCommands(launches=[instance()])
             self.assertEqual(run_case(mock, environment)[0], 0)
             self.assert_counts(mock, 1, 1, 1)
+
+
+    def test_15_cli_empty_collection_stdout(self):
+        # Known list --all with exit 0 and blank stdout/stderr is an empty collection, not a query failure.
+        mock = MockCommands(launches=[instance()])
+        self.assertEqual(run_case(mock)[0], 0)
+        self.assertGreater(mock.blank_list_responses, 0)
+        self.assert_counts(mock, 1, 1, 1)
+
+        for stdout, stderr in (('{"data":[]}', ''), ('\n', '\n')):
+            with self.subTest(stdout=stdout, stderr=stderr):
+                rendered = subprocess.CompletedProcess([], 0, stdout, stderr)
+                mock = MockCommands(target_lists=[rendered], launches=[instance()])
+                self.assertEqual(run_case(mock)[0], 0)
+                self.assert_counts(mock, 1, 1, 1)
+
+        noisy = subprocess.CompletedProcess([], 0, '', 'Warning: ' + SENSITIVE)
+        mock = MockCommands(target_lists=[noisy], launches=[instance()])
+        status, output = run_case(mock)
+        self.assertEqual(status, 1)
+        self.assert_counts(mock, 0, 1, 1)
+        self.assertIn('stage=target_instances category=stdout_empty http=none', output)
+
+        header_only = subprocess.CompletedProcess([], 0, '{"opc-total-items":"0"}', '')
+        mock = MockCommands(target_lists=[header_only], launches=[instance()])
+        status, output = run_case(mock)
+        self.assertEqual(status, 1)
+        self.assert_counts(mock, 0, 1, 1)
+        self.assertIn('stage=target_instances category=invalid_response http=none', output)
+
+        mock = MockCommands(launches=[subprocess.CompletedProcess([], 0, '', ''), instance()])
+        status, output = run_case(mock)
+        self.assertEqual(status, 1)
+        self.assert_counts(mock, 1, 1, 1)
+        self.assertEqual(mock.target_queries, 3)
+        self.assertEqual(mock.launches, [instance()])
+        self.assertIn('Launch outcome unknown', mock.notifications[0])
+        self.assertIn('stage=target_instances category=unknown_result http=none', output)
+        # Direct parser check: requery replaces the global stage, so the launch category is asserted here.
+        namespace = {}
+        prefix = SOURCE.split("\ntry:\n    need(env.get('HUNT_DIAGNOSTIC_ONLY'", 1)[0]
+        def blank_success(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, '', '')
+        with patch.dict(os.environ, {'HUNT_DIAGNOSTIC_LOCK': 'false', 'OCI_COMPARTMENT_ID': COMPARTMENT}, clear=True), \
+                patch('subprocess.run', side_effect=blank_success):
+            exec(compile(prefix, str(WORKFLOW), 'exec'), namespace)
+            self.assertEqual(namespace['oci']('bv', 'volume', 'list', '--compartment-id', COMPARTMENT, '--all'), [])
+            with self.assertRaises(namespace['OciError']) as caught:
+                namespace['oci']('compute', 'instance', 'list', '--compartment-id', COMPARTMENT)
+            self.assertEqual(caught.exception.category, 'stdout_empty')
+            with self.assertRaises(namespace['OciError']) as caught:
+                namespace['oci']('compute', 'instance', 'launch', '--shape', ARM, launch=True)
+            self.assertEqual(caught.exception.category, 'stdout_empty')
+            with self.assertRaises(namespace['OciError']) as caught:
+                namespace['oci']('network', 'subnet', 'get', '--subnet-id', 'mock')
+            self.assertEqual(caught.exception.category, 'stdout_empty')
+
+        mock = MockCommands(overrides={
+            'operation_failure': ('compute', 'image', 'get'),
+            'operation_outcome': subprocess.CompletedProcess([], 0, '', ''),
+        })
+        status, output = run_case(mock, {'IMAGE_ID_ARM': IMAGES[ARM], 'IMAGE_ID_AMD': IMAGES[AMD]})
+        self.assertEqual(status, 1)
+        self.assert_counts(mock, 0, 1, 1)
+        self.assertEqual(mock.target_queries, 0)
+        self.assertIn('stage=image_arm category=stdout_empty http=none', output)
+
+        mock = MockCommands()
+        status, output = run_case(mock, {'HUNT_DIAGNOSTIC_LOCK': 'true'})
+        self.assertEqual(status, 0)
+        self.assertGreater(mock.blank_list_responses, 0)
+        self.assert_counts(mock, 0, 0, 0)
+        self.assertIn('Diagnostic-only complete', output)
 
 
 if __name__ == '__main__':
