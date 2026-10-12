@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
+    inputs:
+      diagnostic_only:
+        description: Read-only OCI checks; never launch, notify or disable
+        type: boolean
+        default: false
 
 permissions:
   actions: write
@@ -17,6 +22,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
+      # Temporary diagnostic lock: all events are read-only until explicitly released.
+      HUNT_DIAGNOSTIC_LOCK: 'true'
+      HUNT_DIAGNOSTIC_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnostic_only == true && 'true' || 'false' }}
       OCI_CLI_REGION: ap-kulai-2
       OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
       OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
@@ -54,13 +62,47 @@ jobs:
           VALID = {'PROVISIONING', 'RUNNING', 'STARTING', 'STOPPING', 'STOPPED', 'MOVING'}
           started = time.monotonic()
           env = os.environ
+          diagnostic_only = env.get('HUNT_DIAGNOSTIC_LOCK', 'true') != 'false' or env.get('HUNT_DIAGNOSTIC_ONLY', 'false') == 'true'
+          stage = 'credentials'
 
           class Halt(Exception):
               pass
 
           class OciError(Exception):
-              def __init__(self, status=None, code='', message=''):
-                  self.status, self.code, self.message = status, code, message
+              def __init__(self, status=None, code='', message='', category='cli_error'):
+                  self.status = status if type(status) is int and 100 <= status <= 599 else None
+                  self.code, self.message, self.category = code, message, category
+
+          def diagnostic_detail(error=None, category='validation_error'):
+              # Only fixed labels and validated numeric HTTP status may leave this process.
+              status = error.status if isinstance(error, OciError) else None
+              if isinstance(error, OciError):
+                  category = {401: 'authentication', 403: 'authorization', 429: 'rate_limit'}.get(
+                      status, 'service_error' if status is not None else error.category)
+                  if error.code == 'LimitExceeded':
+                      category = 'quota'
+              allowed = {'validation_error', 'cli_error', 'timeout', 'transport', 'invalid_response',
+                         'authentication', 'authorization', 'rate_limit', 'service_error', 'quota',
+                         'runner_error', 'unknown_result'}
+              category = category if category in allowed else 'cli_error'
+              return 'stage=' + stage + ' category=' + category + ' http=' + (str(status) if status else 'none')
+
+          def operation_stage(args):
+              operation = tuple(args[:3])
+              labels = {('iam', 'region-subscription', 'list'): 'region_subscription',
+                        ('iam', 'availability-domain', 'list'): 'availability_domains',
+                        ('network', 'subnet', 'get'): 'subnet',
+                        ('iam', 'compartment', 'list'): 'compartments',
+                        ('bv', 'volume', 'list'): 'block_volumes',
+                        ('bv', 'boot-volume', 'list'): 'boot_volumes'}
+              if operation == ('compute', 'instance', 'list'):
+                  return 'target_instances' if args[args.index('--compartment-id') + 1] == env['OCI_COMPARTMENT_ID'] else 'other_instances'
+              if operation == ('compute', 'instance', 'launch'):
+                  return 'launch_arm' if args[args.index('--shape') + 1] == ARM else 'launch_amd'
+              if operation in (('compute', 'image', 'list'), ('compute', 'image', 'get'),
+                               ('compute', 'image-shape-compatibility-entry', 'get')):
+                  return stage  # image_for sets a fixed architecture label before these calls.
+              return labels.get(operation, 'oci_query')
 
           def need(condition, reason):
               if not condition:
@@ -97,7 +139,14 @@ jobs:
               print('ERROR: Telegram delivery failed; inspect GitHub Actions and OCI manually.')
               return False
 
-          def finish(message, success=False):
+          def finish(message, success=False, detail=None):
+              if diagnostic_only:
+                  print('Diagnostic-only stopped: ' + (detail or diagnostic_detail()))
+                  raise SystemExit(1)
+              if not success:
+                  detail = detail or diagnostic_detail()
+                  print('OCI failure: ' + detail)
+                  message += ' ' + detail
               # Notification failure must never prevent the bounded disable attempt.
               notified = notify(message)
               ref = env.get('GITHUB_WORKFLOW_REF', '')
@@ -117,13 +166,18 @@ jobs:
               raise SystemExit(0 if success and disabled and notified else 1)
 
           def oci(*args, launch=False):
+              global stage
+              stage = operation_stage(args)
+              need(not diagnostic_only or not launch, 'Diagnostic mode forbids creation.')
               try:
                   result = subprocess.run(
                       ['oci', '--region', REGION, '--no-retry', '--connection-timeout', '10',
                        '--read-timeout', '30', '--output', 'json', *args],
                       text=True, capture_output=True, timeout=90 if launch else 60)
-              except (OSError, subprocess.TimeoutExpired):
-                  raise OciError() from None
+              except subprocess.TimeoutExpired:
+                  raise OciError(category='timeout') from None
+              except OSError:
+                  raise OciError(category='transport') from None
               if result.returncode:
                   # OCI ServiceError is JSON prefixed by a label. Never relay raw output.
                   raw = result.stderr + '\n' + result.stdout
@@ -131,11 +185,11 @@ jobs:
                       error, _ = json.JSONDecoder().raw_decode(raw[raw.index('{'):])
                       raise OciError(error.get('status'), error.get('code', ''), error.get('message', ''))
                   except (ValueError, AttributeError):
-                      raise OciError() from None
+                      raise OciError(category='cli_error') from None
               try:
                   return json.loads(result.stdout)['data']
               except (ValueError, KeyError, TypeError):
-                  raise OciError() from None
+                  raise OciError(category='invalid_response') from None
 
           def listing(*args):
               rows = oci(*args, '--all')
@@ -181,12 +235,15 @@ jobs:
               return image['id']
 
           def image_for(shape):
+              global stage
+              stage = 'image_arm' if shape == ARM else 'image_amd'
               override = env.get('IMAGE_ID_ARM' if shape == ARM else 'IMAGE_ID_AMD')
               if override:
                   image = oci('compute', 'image', 'get', '--image-id', override)
                   need(isinstance(image, dict), 'Invalid image response.')
                   image_id = validate_image(image, shape)
                   need(image_id == override, 'Image override response does not match.')
+                  stage = 'image_compat_arm' if shape == ARM else 'image_compat_amd'
                   entry = oci('compute', 'image-shape-compatibility-entry', 'get',
                               '--image-id', image_id, '--shape-name', shape)
                   need(isinstance(entry, dict) and entry.get('image-id') == image_id
@@ -246,13 +303,15 @@ jobs:
 
           def reconcile():
               # A failed/partial launch may already have been accepted. Never launch again.
+              detail = None
               try:
                   target = existing_target(inventory(env['OCI_COMPARTMENT_ID']))
                   if target:
                       finish(target_message(target), success=True)
-              except (OciError, Halt):
-                  pass
-              finish('Launch outcome unknown. Check OCI instances and boot volumes manually before re-enabling.')
+              except (OciError, Halt) as error:
+                  detail = diagnostic_detail(error)
+              finish('Launch outcome unknown. Check OCI instances and boot volumes manually before re-enabling.',
+                     detail=detail or diagnostic_detail(category='unknown_result'))
 
           def hunt(ads, images):
               for shape in (ARM, AMD):
@@ -280,7 +339,8 @@ jobs:
                                   and error.message.strip().lower().rstrip('.') == 'out of host capacity':
                               continue
                           if error.status in (400, 401, 403, 404, 409, 422):
-                              raise Halt('OCI rejected creation (authentication, quota or configuration). Check manually.')
+                              finish('OCI rejected creation (authentication, quota or configuration). Check manually.',
+                                     detail=diagnostic_detail(error))
                           reconcile()
                       else:
                           if isinstance(result, dict) and result.get('id') \
@@ -291,6 +351,7 @@ jobs:
               # Every attempted shape/AD explicitly rejected due to host capacity: silent.
 
           try:
+              need(env.get('HUNT_DIAGNOSTIC_ONLY', 'false') in ('true', 'false'), 'Invalid execution mode.')
               required = ('OCI_CLI_TENANCY', 'OCI_CLI_USER', 'OCI_CLI_FINGERPRINT', 'OCI_CLI_KEY_CONTENT',
                           'OCI_COMPARTMENT_ID', 'OCI_SUBNET_ID', 'SSH_PUBLIC_KEY', 'TG_BOT_TOKEN', 'TG_CHAT_ID',
                           'GITHUB_TOKEN', 'GITHUB_REPOSITORY', 'GITHUB_WORKFLOW_REF')
@@ -315,21 +376,33 @@ jobs:
                       env[key] = str(path)
                   env['OCI_CLI_AUTH'] = 'api_key'
                   # Capture installation diagnostics; dependency failures get a sanitized alert.
-                  install = subprocess.run([sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check',
-                                            'oci-cli==3.94.2'], capture_output=True, text=True, timeout=180)
+                  stage = 'cli_install'
+                  try:
+                      install = subprocess.run([sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check',
+                                                'oci-cli==3.94.2'], capture_output=True, text=True, timeout=180)
+                  except subprocess.TimeoutExpired:
+                      raise OciError(category='timeout') from None
+                  except OSError:
+                      raise OciError(category='transport') from None
                   need(install.returncode == 0, 'OCI CLI installation failed. Inspect runner dependencies manually.')
                   try:
                       ads = preflight()
                       images = {shape: image_for(shape) for shape in (ARM, AMD)}
-                  except OciError:
-                      raise Halt('Initial AD, image or safety discovery failed. Confirm manually.') from None
+                  except OciError as error:
+                      finish('Initial AD, image or safety discovery failed. Confirm manually.', detail=diagnostic_detail(error))
+                  if diagnostic_only:
+                      inventory(env['OCI_COMPARTMENT_ID'])
+                      print('Diagnostic-only complete: stage=target_instances category=checks_passed http=none; no launch, notification or disable.')
+                      raise SystemExit(0)
                   check_target()
                   hunt(ads, images)
           except OciError as error:
-              if error.status != 429:
-                  finish('OCI inventory, image or preflight query failed. No further creation; check permissions/configuration.')
+              if diagnostic_only or error.status != 429:
+                  finish('OCI inventory, image or preflight query failed. No further creation; check permissions/configuration.',
+                         detail=diagnostic_detail(error))
           except Halt as error:
               finish(str(error))
           except Exception:
-              finish('Unexpected runner error. Check OCI manually before re-enabling; no further creation.')
+              finish('Unexpected runner error. Check OCI manually before re-enabling; no further creation.',
+                     detail=diagnostic_detail(category='runner_error'))
           PY

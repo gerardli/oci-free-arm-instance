@@ -1,10 +1,20 @@
 # Oracle Always Free 抢建 workflow v3.1
 
-仅使用 `.github/workflows/hunt-free-vm.yml`、内嵌 Python 脚本与 GitHub Secrets。固定 `ap-kulai-2`，每 15 分钟运行，也支持手动运行；GitHub 原生 concurrency（`group: oracle-free-vm-hunt`）串行执行，`cancel-in-progress: false`。当前目录原为空，未初始化 Git，未部署、未连接真实 OCI 创建资源。
+仅使用 `.github/workflows/hunt-free-vm.yml`、内嵌 Python 脚本与 GitHub Secrets。固定 `ap-kulai-2`，保留每 15 分钟和手动触发配置；**当前临时诊断锁开启，所有触发只读、不抢建**；GitHub 原生 concurrency（`group: oracle-free-vm-hunt`）串行执行，`cancel-in-progress: false`。当前目录原为空，未初始化 Git，未部署、未连接真实 OCI 创建资源。
 
 优先创建 `VM.Standard.A1.Flex`（2 OCPU / 12 GB）。只有每个候选 AD 的 ARM 创建均明确返回 `500 InternalError: Out of host capacity`，才尝试 `VM.Standard.E2.1.Micro`（固定规格，约 1/8 OCPU / 1 GB）。AMD 被接受后即停止并禁用 workflow，后续不会继续抢 ARM。所有候选 AD 都限制在上述区域；指定 `AD_NAME` 或使用 AD 专属 subnet 时，只使用对应 AD。
 
 启动盘通过 `--source-details` 显式固定为 50 GB、10 VPU/GB（Balanced），不挂载额外卷、不建立容量预留、不创建网络、负载均衡或付费镜像订阅。使用 `--assign-public-ip true`，要求指定 subnet 明确允许分配公网 IP（`prohibit-public-ip-on-vnic` 为 `false`）；禁止分配或无法确认时停止、禁用 workflow 并告警，不创建实例。实例主 VNIC 将请求分配临时公网 IPv4，供远程 SSH 使用；workflow 不会创建网络资源或修改路由、安全组。公网 IP 本身不保证 SSH 可达，需完成下面的网络检查。
+
+## 当前安全诊断入口（临时锁开启）
+
+当前 workflow 的 `HUNT_DIAGNOSTIC_LOCK: 'true'` 是固定代码门：定时触发和手动触发（即使未勾选 `diagnostic_only`）均只做安装/认证准备及只读 OCI 检查，不 launch、不发送 Telegram、不禁用 workflow；生产 launch 入口另有诊断模式拒绝保护。锁缺失或不是精确字符串 `false` 时仍保持诊断。手动 `diagnostic_only: true` 在解除锁后也可单次只读运行。诊断仍需现有必填 Secrets、内置 GitHub 上下文及 IAM 查询权限；不要把真实值放进运行输入或日志。
+
+下一次人工诊断：先保持旧 workflow 禁用，确认默认分支已包含该固定锁，再由人工启用并手动运行；定时抢先触发也只读。日志仅提供固定 `stage`、白名单 `category`、经校验的 `http` 数字或 `none`。阶段包括 credentials、cli_install、region_subscription、availability_domains、subnet、compartments、other_instances、block_volumes、boot_volumes、image_arm/amd、image_compat_arm/amd、target_instances；不输出 CLI 原始响应、错误文本、参数、OCID 或凭据。诊断错误退出 1，所有检查完成退出 0，均不能证明真实创建或通知成功。
+
+当前“Initial AD, image or safety discovery failed”只证明前置发现失败，不能推定 Secrets 有误或某个 CLI 参数无效。取得上述脱敏阶段/类别/HTTP 后再定位原因；不要求提供原始日志或凭据。诊断期间定时运行仍会执行只读检查；完成取证后人工禁用以停止重复检查。恢复普通抢建必须先禁用并等待已有诊断运行结束，核实诊断原因和下述免费额度/并发条件，再审核将固定锁改成 `'false'`，重跑离线验收后由人工发布和启用。未解除锁不得声称已恢复抢建；解除后 schedule 可能立即运行，应在启用前完成全部确认。本次未发布、启用或进行真实诊断。
+
+此锁是临时偏离 PLAN-v3.1 的安全诊断门，不增加状态文件或重试；正常模式原有成功即停、禁用、异常仲裁及费用限制保留。普通异常也只追加上述脱敏诊断信息，不转发原始错误。
 
 ## 部署前必须人工确认
 
@@ -49,7 +59,7 @@
 
 安装固定版本 CLI，未实现原文的 `~/.local` 缓存；认证使用 API-key 环境变量和隔离临时密钥文件，未还原 `~/.oci/config`。保留原有 tenancy / 存储 / subnet 安全盘点及额外 IAM 要求，仍支持同区域候选 AD，严格镜像验证允许 Ubuntu 24.04 Minimal；这些实现选择未在本轮重构，不代表与方案原文逐项等同，也不证明真实免费资格。每轮先完成 AD、安全盘点和 ARM/AMD 镜像发现，再查目标实例；已发现镜像在本轮复用，每次 launch 前仍复查实例与资源余量。
 
-## 停止和异常规则
+## 普通模式停止和异常规则（解除诊断锁后）
 
 - 每次创建前用 `oci compute instance list --all` 查指定 compartment，跨全部 AD，不按名称筛选。RUNNING、PROVISIONING、STARTING、STOPPING、STOPPED、MOVING、TERMINATING 都按非 TERMINATED 的已有目标实例处理：通知中包含实际 shape 和状态，说明目标已达成，然后禁用 workflow，不再创建。TERMINATED 可忽略；未知状态保守停止、告警并禁用。
 - 所有 OCI 命令均包含 `--no-retry`；无 CLI 内部重试、等待器或自动退避。两次候选创建之间重新查询实例和整个 tenancy 的免费资源余量。库存为空不等于 API 提供原子锁。

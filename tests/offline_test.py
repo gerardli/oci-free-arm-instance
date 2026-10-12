@@ -73,8 +73,12 @@ class MockCommands:
                 assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
                 self.secret_files.append(path)
             assert 'OCI_CLI_KEY_CONTENT' not in os.environ
-            return subprocess.CompletedProcess(command, 0, '', '')
+            outcome = self.overrides.get('install_outcome')
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome or subprocess.CompletedProcess(command, 0, '', '')
         if command[0] == 'curl':
+            assert os.environ.get('HUNT_DIAGNOSTIC_LOCK', 'true') == 'false' and os.environ.get('HUNT_DIAGNOSTIC_ONLY') != 'true', 'Diagnostic mode must not notify or disable'
             assert command[1:3] == ['--config', '-']
             config = kwargs['input']
             assert SENSITIVE not in ' '.join(command)
@@ -110,6 +114,11 @@ class MockCommands:
         args = command[10:]
         # Exact prefix: oci --region R --no-retry --connection-timeout 10 --read-timeout 30 --output json
         operation = tuple(args[:3])
+        if operation == self.overrides.get('operation_failure'):
+            outcome = self.overrides['operation_outcome']
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
         if args[-1:] == ['--all']:
             assert '--limit' not in args
         elif operation[2] == 'list':
@@ -167,6 +176,7 @@ class MockCommands:
         elif operation == ('compute', 'image-shape-compatibility-entry', 'get'):
             data = {'image-id': args[args.index('--image-id') + 1], 'shape': args[args.index('--shape-name') + 1]}
         elif operation == ('compute', 'instance', 'launch'):
+            assert os.environ.get('HUNT_DIAGNOSTIC_LOCK', 'true') == 'false' and os.environ.get('HUNT_DIAGNOSTIC_ONLY') != 'true', 'Diagnostic mode must never launch'
             self.creates.append(command)
             self.events.append('launch')
             assert self.events.count('image:' + ARM) == 1
@@ -209,6 +219,7 @@ class MockCommands:
 
 def run_case(mock, environment=None):
     env = {
+        'HUNT_DIAGNOSTIC_LOCK': 'false',  # Explicitly test the preserved normal path after lock release.
         'OCI_CLI_TENANCY': TENANCY, 'OCI_CLI_USER': 'mock-user', 'OCI_CLI_FINGERPRINT': 'mock-fingerprint',
         'OCI_CLI_KEY_CONTENT': SENSITIVE, 'OCI_COMPARTMENT_ID': COMPARTMENT,
         'OCI_SUBNET_ID': 'ocid1.subnet.oc1.ap-kulai-2.mock', 'SSH_PUBLIC_KEY': 'ssh-ed25519 bW9jaw==',
@@ -217,21 +228,24 @@ def run_case(mock, environment=None):
         'GITHUB_WORKFLOW_REF': 'mock-owner/mock-repo/.github/workflows/hunt-free-vm.yml@refs/heads/main',
     }
     env.update(environment or {})
+    env = {key: value for key, value in env.items() if value is not None}
     output = io.StringIO()
+    stderr = io.StringIO()
     with tempfile.TemporaryDirectory(prefix='oci-offline-') as home:
         env.update({'HOME': home, 'TMPDIR': home, 'OCI_CLI_CONFIG_FILE': str(Path(home) / 'absent-config')})
         # Force tempfile isolation as well as credential/environment isolation.
         with patch.object(tempfile, 'tempdir', home), patch.dict(os.environ, env, clear=True), \
-                patch('subprocess.run', side_effect=mock), contextlib.redirect_stdout(output):
+                patch('subprocess.run', side_effect=mock), contextlib.redirect_stdout(output), contextlib.redirect_stderr(stderr):
             try:
                 exec(compile(SOURCE, str(WORKFLOW), 'exec'), {'__name__': '__main__'})
                 status = 0
             except SystemExit as exit_result:
                 status = exit_result.code
         assert not mock.unexpected, 'Unknown external call was blocked'
-        assert SENSITIVE not in output.getvalue()
+        assert SENSITIVE not in output.getvalue() + stderr.getvalue()
+        assert 'ocid1.' not in output.getvalue() + stderr.getvalue()
         assert all(not path.exists() for path in mock.secret_files), 'Temporary credentials were not removed'
-    return status, output.getvalue()
+    return status, output.getvalue() + stderr.getvalue()
 
 
 class OfflineAcceptance(unittest.TestCase):
@@ -471,6 +485,133 @@ class OfflineAcceptance(unittest.TestCase):
             pairs[match[1]] = match[2].strip()
         self.assertEqual(pairs, {'group': 'oracle-free-vm-hunt', 'cancel-in-progress': 'false'})
         self.assertEqual(len(re.findall(r'(?m)^concurrency:', TEXT)), 1)
+
+
+    def test_11_diagnostic_mode_never_mutates(self):
+        mode = {'HUNT_DIAGNOSTIC_ONLY': 'true'}
+        for targets in ([], [instance()], [instance(AMD, 'TERMINATING')]):
+            with self.subTest(existing=bool(targets)):
+                mock = MockCommands(target_lists=[targets])
+                status, output = run_case(mock, mode)
+                self.assertEqual(status, 0)
+                self.assert_counts(mock, 0, 0, 0)
+                self.assertEqual(mock.target_queries, 1)
+                self.assertEqual(mock.events.count('image:' + ARM), 1)
+                self.assertEqual(mock.events.count('image:' + AMD), 1)
+                self.assertIn('Diagnostic-only complete', output)
+        for query in (service_error(429, 'TooManyRequests', SENSITIVE),
+                      service_error(401, 'NotAuthenticated', SENSITIVE),
+                      OSError(SENSITIVE), [{}]):
+            with self.subTest(query_type=type(query).__name__):
+                mock = MockCommands(target_lists=[query])
+                status, output = run_case(mock, mode)
+                self.assertEqual(status, 1)
+                self.assert_counts(mock, 0, 0, 0)
+                self.assertIn('stage=target_instances', output)
+        mock = MockCommands(overrides={'home': 'invalid-region'})
+        self.assertEqual(run_case(mock, mode)[0], 1)
+        self.assert_counts(mock, 0, 0, 0)
+        # Independent launch guard, even if a future caller bypasses the main-mode branch.
+        namespace = {}
+        prefix = SOURCE.split("\ntry:\n    need(env.get('HUNT_DIAGNOSTIC_ONLY'", 1)[0]
+        with patch.dict(os.environ, mode, clear=True), patch('subprocess.run') as external:
+            exec(compile(prefix, str(WORKFLOW), 'exec'), namespace)
+            with self.assertRaises(namespace['Halt']):
+                namespace['oci']('compute', 'instance', 'launch', '--shape', ARM, launch=True)
+            external.assert_not_called()
+
+    def test_12_fixed_stage_and_error_categories(self):
+        stages = {
+            ('iam', 'region-subscription', 'list'): 'region_subscription',
+            ('iam', 'availability-domain', 'list'): 'availability_domains',
+            ('network', 'subnet', 'get'): 'subnet',
+            ('iam', 'compartment', 'list'): 'compartments',
+            ('bv', 'volume', 'list'): 'block_volumes',
+            ('bv', 'boot-volume', 'list'): 'boot_volumes',
+            ('compute', 'instance', 'list'): 'other_instances',
+        }
+        for operation, stage_name in stages.items():
+            for mode in ('true', 'false'):
+                with self.subTest(stage=stage_name, diagnostic=mode):
+                    mock = MockCommands(overrides={'operation_failure': operation,
+                        'operation_outcome': service_error(403, SENSITIVE, SENSITIVE)})
+                    status, output = run_case(mock, {'HUNT_DIAGNOSTIC_ONLY': mode})
+                    self.assertEqual(status, 1)
+                    self.assert_counts(mock, 0, 0 if mode == 'true' else 1, 0 if mode == 'true' else 1)
+                    self.assertIn('stage=' + stage_name + ' category=authorization http=403', output)
+        outcomes = [(service_error(401, 'NotAuthenticated', SENSITIVE), 'authentication', '401'),
+                    (service_error(429, 'TooManyRequests', SENSITIVE), 'rate_limit', '429'),
+                    (service_error(400, 'LimitExceeded', SENSITIVE), 'quota', '400'),
+                    (service_error(500, SENSITIVE, SENSITIVE), 'service_error', '500'),
+                    (service_error(None, SENSITIVE, SENSITIVE), 'cli_error', 'none'),
+                    (subprocess.TimeoutExpired(['mock'], 60, output=SENSITIVE, stderr=SENSITIVE), 'timeout', 'none'),
+                    (OSError(SENSITIVE), 'transport', 'none'),
+                    (subprocess.CompletedProcess([], 0, SENSITIVE, SENSITIVE), 'invalid_response', 'none')]
+        for outcome, category, http_status in outcomes:
+            with self.subTest(category=category):
+                mock = MockCommands(overrides={'operation_failure': ('iam', 'region-subscription', 'list'),
+                                              'operation_outcome': outcome})
+                status, output = run_case(mock, {'HUNT_DIAGNOSTIC_ONLY': 'true'})
+                self.assertEqual(status, 1)
+                self.assert_counts(mock, 0, 0, 0)
+                self.assertIn('stage=region_subscription category=' + category + ' http=' + http_status, output)
+        for shape in (ARM, AMD):
+            for mode in ('true', 'false'):
+                mock = MockCommands(overrides={'image_failure': shape})
+                status, output = run_case(mock, {'HUNT_DIAGNOSTIC_ONLY': mode})
+                self.assertEqual(status, 1)
+                self.assert_counts(mock, 0, 0 if mode == 'true' else 1, 0 if mode == 'true' else 1)
+                self.assertIn('stage=image_' + ('arm' if shape == ARM else 'amd') + ' category=authentication http=401', output)
+            mock = MockCommands(overrides={'operation_failure': ('compute', 'image-shape-compatibility-entry', 'get'),
+                                          'operation_outcome': service_error(403, SENSITIVE, SENSITIVE)})
+            status, output = run_case(mock, {'HUNT_DIAGNOSTIC_ONLY': 'true',
+                'IMAGE_ID_ARM' if shape == ARM else 'IMAGE_ID_AMD': IMAGES[shape]})
+            self.assertEqual(status, 1)
+            self.assert_counts(mock, 0, 0, 0)
+            self.assertIn('stage=image_compat_' + ('arm' if shape == ARM else 'amd'), output)
+        for outcome, category in ((OSError(SENSITIVE), 'transport'),
+                                  (subprocess.TimeoutExpired(['mock'], 180, stderr=SENSITIVE), 'timeout'),
+                                  (subprocess.CompletedProcess([], 1, SENSITIVE, SENSITIVE), 'validation_error')):
+            mock = MockCommands(overrides={'install_outcome': outcome})
+            status, output = run_case(mock, {'HUNT_DIAGNOSTIC_ONLY': 'true'})
+            self.assertEqual(status, 1)
+            self.assert_counts(mock, 0, 0, 0)
+            self.assertIn('stage=cli_install category=' + category, output)
+
+    def test_13_untrusted_errors_never_relayed(self):
+        for status in (SENSITIVE, True, {'untrusted': SENSITIVE}, 999):
+            for mode in ('true', 'false'):
+                mock = MockCommands(overrides={'operation_failure': ('iam', 'region-subscription', 'list'),
+                    'operation_outcome': service_error(status, SENSITIVE, SENSITIVE)})
+                result, output = run_case(mock, {'HUNT_DIAGNOSTIC_ONLY': mode})
+                self.assertEqual(result, 1)
+                self.assertIn('category=cli_error http=none', output)
+                self.assert_counts(mock, 0, 0 if mode == 'true' else 1, 0 if mode == 'true' else 1)
+        for payload in (SENSITIVE, 'ServiceError: []', 'ServiceError: null',
+                        'ServiceError: {"status":401,"code":[],"message":{}}'):
+            mock = MockCommands(overrides={'operation_failure': ('iam', 'region-subscription', 'list'),
+                'operation_outcome': subprocess.CompletedProcess([], 1, payload, payload)})
+            status, output = run_case(mock, {'HUNT_DIAGNOSTIC_ONLY': 'true'})
+            self.assertEqual(status, 1)
+            self.assert_counts(mock, 0, 0, 0)
+            self.assertNotIn(payload, output)
+
+    def test_14_diagnostic_selector_structure(self):
+        self.assertRegex(TEXT, r'workflow_dispatch:\n    inputs:\n      diagnostic_only:\n        description: [^\n]+\n        type: boolean\n        default: false')
+        self.assertIn("github.event_name == 'workflow_dispatch' && inputs.diagnostic_only == true && 'true' || 'false'", TEXT)
+        self.assertNotIn('${{ inputs.diagnostic_only }}', SOURCE)
+        self.assertIn("HUNT_DIAGNOSTIC_LOCK: 'true'", TEXT)
+        for event in ('schedule', 'workflow_dispatch'):
+            for lock in ('true', '', 'unexpected', None):
+                mock = MockCommands()
+                status, output = run_case(mock, {'GITHUB_EVENT_NAME': event, 'HUNT_DIAGNOSTIC_LOCK': lock, 'HUNT_DIAGNOSTIC_ONLY': 'false'})
+                self.assertEqual(status, 0)
+                self.assert_counts(mock, 0, 0, 0)
+                self.assertIn('Diagnostic-only complete:', output)
+        for environment in ({}, {'HUNT_DIAGNOSTIC_ONLY': 'false'}):
+            mock = MockCommands(launches=[instance()])
+            self.assertEqual(run_case(mock, environment)[0], 0)
+            self.assert_counts(mock, 1, 1, 1)
 
 
 if __name__ == '__main__':

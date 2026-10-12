@@ -1,8 +1,8 @@
-# workflow v3.1 本次离线修复验收
+# workflow v3.1 离线修复与只读诊断验收
 
 日期：2026-10-12。基线：用户提供并确认的 PLAN-v3.1 终审文本及本次会话三项歧义解释。只修改 workflow、维护测试、README 和本报告；未联网、安装依赖、调用真实 API、部署、创建资源、发送真实通知、commit 或 push。
 
-## 历史证据与本次证据
+## 上轮基线修复证据（历史；本轮重新回归）
 
 2026-10-11 的旧报告是实现 Agent 自测，历史结果为五组通过，不能替代本次基线验收。其中“TERMINATING 静默退出”和“禁用失败合并为一次通知”的旧 PASS 不满足已确认基线，现已修复并替换断言。修复开始前核对四文件 SHA-256 均与独立审计记录一致：
 
@@ -99,3 +99,52 @@ RB
 ## 独立复核
 
 修复完成后，未参与修改的独立审查者 repair_review 只读复核四文件、修复前会话记录、关键控制流和测试证据；没有 Git 基线快照，不把文本变化比较声称为 Git diff。审查者独立重跑维护测试：10 方法、0.193s、退出 0；独立执行 Ruby 精确 YAML 结构检查及 bash -n：退出 0。独立审查最终结论：本轮指定修复及离线验收通过，未发现阻塞项或本轮引入的高/中风险回归，与实现者结论无分歧；审查者未修改任何文件。测试隔离、未知调用拒绝及生产脚本一致性均已核实。
+
+
+## 本轮：前置失败只读诊断（2026-10-12）
+
+用户提供的真实运行证据只有初始前置失败提示、Workflow disabled 和退出 1；这些不足以确认具体操作或根因。未读取真实运行日志或账号配置，未联网，不认定 Secrets 错误，也未判定 `--include-root` 参数无效。本轮修改前四文件与上轮交付指纹一致：
+
+| 文件 | 本轮修改前 SHA-256 |
+| --- | --- |
+| .github/workflows/hunt-free-vm.yml | c605f31d061202dfdaa9ad47c683a821607317ee52af6583db2a3849b57d9c1b |
+| tests/offline_test.py | 6d5e43b920425f3c056b3a29006af82997135c45c7895290c8064b3c7a1aed7b |
+| README.md | 032e1abd8243b9a882ead262ea929cbcf28abe84f13e7b040507034f4b5ddbeb |
+| OFFLINE_TEST_REPORT.md | 0ba2f282d9bd593c9c65265c01b893753f120d10da47ef78f8585b432a2a0e37 |
+
+生产脚本增加固定阶段标识及白名单错误类别，HTTP 状态只接受整数 100–599；异常文本、返回体、参数、OCID、凭据不进入诊断消息。正常异常告警仍先发送，再禁用，非 204 追加独立告警；只追加脱敏诊断字段。创建不明仍仅复查一次，复查失败/429/空值保守停止，401/403 不复查，明确容量不足才 fallback，--no-retry 和免费规格不变。
+
+新增手动布尔输入 diagnostic_only，但不依靠手动勾选避免竞态：当前固定 `HUNT_DIAGNOSTIC_LOCK: 'true'` 覆盖所有事件；即使刚启用后 schedule 抢先运行，也不能 launch、通知或禁用。锁缺失或非精确 false 也只读；launch 入口另有拒绝门。临时锁导致当前每 15 分钟只读检查、不会抢建，这是明确保留的临时基线偏离。恢复须先人工禁用并等待运行结束，查明故障并重新确认免费额度、已有资源及并发条件，审核改锁为 false、离线验收后才人工发布启用。未执行这些真实步骤。
+
+本次测试原样提取当前生产 heredoc，清空环境、虚构凭据、隔离 HOME/TMPDIR，所有 subprocess 调用 mock，未知调用拒绝，诊断模式 mock 额外禁止任何 launch/curl 穿透。新增 stderr 和 stdout 双向敏感标记检查。第一次补充“环境变量缺失”场景时测试夹具不能注入 None，发生 TypeError（未执行真实调用）；已改为从隔离环境删除该字段，最终全量重跑成功。
+
+本轮实际命令：
+
+```zsh
+task_tmp=$(mktemp -d /private/tmp/oci-diagnostic.XXXXXX)
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$task_tmp" TMPDIR="$task_tmp" /usr/bin/python3 -I tests/offline_test.py 2>&1 | sed 's|/Users/[^/]*/|$HOME/|g'
+result=${pipestatus[1]}
+rm -f "$task_tmp/xcrun_db"
+rmdir "$task_tmp"
+exit "$result"
+```
+
+最终实际结果：14 方法、0.422s、退出码 0。原五组及上轮所有补充分支本轮重新执行通过，不使用旧 PASS 替代。普通场景显式设置固定锁 false，以验证恢复后的实际生产路径。
+
+| 本轮新增/强化场景 | 关键断言与实际结果 |
+| --- | --- |
+| 诊断全通过、已有 ARM、已有 AMD TERMINATING | PASS：launch/TG/disable 全 0；两架构镜像检查完成，目标查询一次 |
+| 诊断查询 429、401、连接异常、字段缺失及安全验证失败 | PASS：退出 1，三类变更调用均 0；固定阶段可定位 |
+| region、AD、subnet、compartments、other_instances、block/boot volume 查询失败 | PASS：各阶段标签正确；诊断无变更；普通模式保守告警禁用 |
+| ARM/AMD 镜像及覆盖兼容性查询失败 | PASS：对应架构阶段标签正确，首次创建前停止 |
+| 401、403、429、配额、500、CLI 错误、超时、传输、坏 JSON | PASS：白名单 category/HTTP 或 none；敏感标记和 OCID 不进入 stdout/stderr/通知 |
+| 非整数/越界 HTTP，异常 code/message/返回体类型 | PASS：不转发外部文本；保守停止，无创建 |
+| CLI 安装超时、传输失败、非零返回 | PASS：cli_install 阶段、固定类别、诊断无变更 |
+| schedule/手动 × 固定锁 true/空/异常/缺失，输入 false | PASS：全部只读；解除精确 false 后正常 ARM 成功停止，单次 diagnostic_only true 仍只读 |
+| 绕过主流程直接调用诊断 launch 入口 | PASS：拒绝且 subprocess 未调用 |
+
+另实际执行系统 Ruby YAML.safe_load 和 /bin/bash -n：退出 0。在上轮报告的解析检查基础上增加 diagnostic_only type=boolean/default=false、HUNT_DIAGNOSTIC_LOCK 精确字符串 true、手动选择表达式精确匹配断言；仍核对 schedule、permissions、concurrency 和单 bash step。未运行 actionlint，未验证 GitHub 真实事件求值或实际触发；固定锁不依赖输入表达式求值正确才能阻止创建。
+
+本轮不新增状态文件、重试、依赖或盘点；保留上文列出的缓存、认证载体、额外 IAM/存储盘点等方案偏离。真实故障根因未验证；四项真实环境验证及真实诊断、通知送达、免费资格均未验证。离线成功不表示已部署、恢复抢建或保证零费用。
+
+本轮独立只读复核：进行中，待记录最终结论。
