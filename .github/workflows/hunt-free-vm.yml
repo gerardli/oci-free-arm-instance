@@ -81,7 +81,11 @@ jobs:
                       category = 'quota'
               allowed = {'validation_error', 'sdk_error', 'timeout', 'transport', 'invalid_response',
                          'authentication', 'authorization', 'rate_limit', 'service_error',
-                         'quota', 'runner_error', 'unknown_result'}
+                         'quota', 'runner_error', 'unknown_result',
+                         'private_key_passphrase', 'private_key_is_public', 'private_key_invalid',
+                         'private_key_non_ascii', 'private_key_malformed', 'private_key_unknown',
+                         'credential_field_fingerprint', 'credential_field_user', 'credential_field_tenancy',
+                         'credential_field_unknown'}
               category = category if category in allowed else 'sdk_error'
               detail = 'stage=' + stage + ' category=' + category + ' http=' + (str(status) if status else 'none')
               return detail
@@ -89,6 +93,26 @@ jobs:
           def need(condition, reason):
               if not condition:
                   raise Halt(reason)
+
+          KEY_CATEGORIES = (('requires a passphrase', 'private_key_passphrase'),
+                            ('authentication requires a private key', 'private_key_is_public'),
+                            ('is not a private key', 'private_key_invalid'),
+                            ('codec can\'t encode character', 'private_key_non_ascii'),
+                            ('codec can\'t decode byte', 'private_key_non_ascii'),
+                            ('could not deserialize key data', 'private_key_malformed'),
+                            ('unable to load key', 'private_key_malformed'),
+                            ('invalid private key', 'private_key_invalid'))
+
+          def private_key_category(error):
+              text = str(error).lower()
+              return next((label for needle, label in KEY_CATEGORIES if needle in text), 'private_key_unknown')
+
+          CREDENTIAL_FIELDS = ('fingerprint', 'user', 'tenancy')
+
+          def credential_field_category(error):
+              fields = error.errors if isinstance(getattr(error, 'errors', None), dict) else {}
+              return next(('credential_field_' + field for field in CREDENTIAL_FIELDS if field in fields),
+                          'credential_field_unknown')
 
           def http(url, method, headers=(), data=None):
               # Credentials go through stdin, never command arguments or logs.
@@ -377,13 +401,20 @@ jobs:
               config = dict(region=REGION, log_requests=False,
                             tenancy=env['OCI_CLI_TENANCY'], user=env['OCI_CLI_USER'],
                             fingerprint=env['OCI_CLI_FINGERPRINT'], key_content=env.pop('OCI_CLI_KEY_CONTENT'))
-              signer = sdk.signer.Signer(config['tenancy'], config['user'], config['fingerprint'],
-                                         None, private_key_content=config['key_content'])
+              try:
+                  signer = sdk.signer.Signer(config['tenancy'], config['user'], config['fingerprint'],
+                                             None, private_key_content=config['key_content'])
+              except Exception as error:
+                  raise OciError(category=private_key_category(error)) from None
               options = dict(signer=signer, retry_strategy=no_retry, timeout=(10, 30))
-              identity = sdk.identity.IdentityClient(config, **options)
-              compute = sdk.core.ComputeClient(config, **options)
-              network = sdk.core.VirtualNetworkClient(config, **options)
-              storage_client = sdk.core.BlockstorageClient(config, **options)
+              # Client construction validates user/tenancy/fingerprint shape; label failures by field name.
+              try:
+                  identity = sdk.identity.IdentityClient(config, **options)
+                  compute = sdk.core.ComputeClient(config, **options)
+                  network = sdk.core.VirtualNetworkClient(config, **options)
+                  storage_client = sdk.core.BlockstorageClient(config, **options)
+              except sdk.exceptions.InvalidConfig as error:
+                  raise OciError(category=credential_field_category(error)) from None
               check_target()
               ad = preflight()
               if diagnostic_only:

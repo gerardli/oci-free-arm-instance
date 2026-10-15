@@ -1,739 +1,520 @@
-"""Five offline acceptance groups. Every external command is mocked."""
+"""Execute the production heredoc with real OCI SDK models/methods, fake I/O only."""
 import contextlib
 import io
 import json
+import logging
 import os
 from pathlib import Path
-import re
-import stat
+import socket
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
+import oci
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
-WORKFLOW = ROOT / '.github/workflows/hunt-free-vm.yml'
-TEXT = WORKFLOW.read_text()
+TEXT = (ROOT / '.github/workflows/hunt-free-vm.yml').read_text()
 SOURCE = '\n'.join(line[10:] for line in TEXT.split("          python3 - <<'PY'\n", 1)[1].rsplit('\n          PY', 1)[0].splitlines())
-ARM = 'VM.Standard.A1.Flex'
-AMD = 'VM.Standard.E2.1.Micro'
+ARM, AMD = 'VM.Standard.A1.Flex', 'VM.Standard.E2.1.Micro'
 REGION = 'ap-kulai-2'
-TENANCY = 'ocid1.tenancy.oc1..mock'
-COMPARTMENT = 'ocid1.compartment.oc1..mock'
-AD = 'mock:AP-KULAI-2-AD-1'
-IMAGE = 'ocid1.image.oc1.ap-kulai-2.mock-arm'
-IMAGES = {ARM: IMAGE, AMD: 'ocid1.image.oc1.ap-kulai-2.mock-amd'}
-SENSITIVE = 'MOCK_SENSITIVE_NEVER_RELAY'
+TENANCY, TARGET = 'ocid1.tenancy.oc1..fake', 'ocid1.compartment.oc1..fake'
+AD = 'fake:AP-KULAI-2-AD-1'
+MARKER = 'FAKE_SENSITIVE_MUST_NOT_LEAVE_PROCESS'
+M = oci.core.models
+
+
+def response(data, headers=None):
+    return oci.response.Response(200, headers or {}, data, None)
 
 
 def instance(shape=ARM, state='PROVISIONING'):
-    return {'id': 'ocid1.instance.oc1.ap-kulai-2.mock', 'shape': shape, 'lifecycle-state': state}
+    return M.Instance(id='ocid1.instance.oc1.ap-kulai-2.fake', shape=shape, lifecycle_state=state)
 
 
-def service_error(status, code, message):
-    return subprocess.CompletedProcess([], 1, '', 'ServiceError:\n' + json.dumps(
-        {'status': status, 'code': code, 'message': message, 'credentials': SENSITIVE}))
+def image(shape=ARM, **kw):
+    fields = dict(id='ocid1.image.oc1.ap-kulai-2.fake-' + ('arm' if shape == ARM else 'amd'),
+                  compartment_id=None, operating_system='Canonical Ubuntu', operating_system_version='24.04',
+                  lifecycle_state='AVAILABLE', size_in_mbs=1024,
+                  display_name='Canonical-Ubuntu-24.04' + ('-aarch64' if shape == ARM else '') + '-2026.10.01-0')
+    fields.update(kw)
+    return M.Image(**fields)
 
 
-CAPACITY = service_error(500, 'InternalError', 'Out of host capacity.')
+def error(status=403, code='NotAuthorizedOrNotFound', message=MARKER):
+    return oci.exceptions.ServiceError(status, code, {}, message)
 
 
-class MockCommands:
-    def __init__(self, launches=(), target_lists=((),), disable_status=204, query_error=None, overrides=None):
-        self.launches = list(launches)
-        self.target_lists = list(target_lists)
-        self.disable_status = disable_status
-        self.query_error = query_error
+def capacity():
+    return error(500, 'InternalError', 'Out of host capacity.')
+
+
+class FakeIO:
+    def __init__(self, launches=(), targets=((),), overrides=None, notify_ok=True, disable_status=204):
+        self.launches, self.targets = list(launches), list(targets)
         self.overrides = overrides or {}
-        self.calls = []
-        self.creates = []
-        self.notifications = []
-        self.disables = []
-        self.secret_files = []
-        self.target_queries = 0
-        self.blank_list_responses = 0
-        self.events = []
-        self.unexpected = []
+        self.notify_ok, self.disable_status = notify_ok, disable_status
+        self.queries, self.creates, self.notifications, self.disables, self.events, self.unexpected = [], [], [], [], [], []
+        self.target_round = -1
+        self.image_shapes = []
 
-    def __call__(self, command, **kwargs):
+    def api(self, base, resource_path, method, **kw):
         try:
-            return self.dispatch(command, **kwargs)
-        except AssertionError:
-            self.unexpected.append('mock contract violation')
+            return self._api(base, resource_path, method, **kw)
+        except AssertionError as failure:
+            trace = failure.__traceback__
+            while trace.tb_next:
+                trace = trace.tb_next
+            self.unexpected.append('SDK contract violation at fixture line ' + str(trace.tb_lineno))
             raise
 
-    def dispatch(self, command, **kwargs):
-        self.calls.append(command)
-        self.assert_capture(kwargs)
-        if command[1:4] == ['-m', 'pip', 'install']:
-            self.events.append('install')
-            assert command[-1] == 'oci-cli==3.94.2'
-            for key in ('OCI_CLI_KEY_FILE', 'HUNT_SSH_FILE'):
-                path = Path(os.environ[key])
-                assert stat.S_IMODE(path.stat().st_mode) == 0o600
-                assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
-                self.secret_files.append(path)
-            assert 'OCI_CLI_KEY_CONTENT' not in os.environ
-            outcome = self.overrides.get('install_outcome')
-            if isinstance(outcome, Exception):
-                raise outcome
-            return outcome or subprocess.CompletedProcess(command, 0, '', '')
-        if command[0] == 'curl':
-            assert os.environ.get('HUNT_DIAGNOSTIC_LOCK', 'true') == 'false' and os.environ.get('HUNT_DIAGNOSTIC_ONLY') != 'true', 'Diagnostic mode must not notify or disable'
-            assert command[1:3] == ['--config', '-']
-            config = kwargs['input']
-            assert SENSITIVE not in ' '.join(command)
+    def _api(self, base, resource_path, method, **kw):
+        op = kw['operation_name']
+        self.events.append(op)
+        assert base.endpoint.endswith('oraclecloud.com/20160918') and REGION in base.endpoint
+        assert base.timeout == (10, 30)
+        assert os.environ['OCI_HEADER_PARSING_ERROR_MAX_RETRIES'] == '0'
+        query = dict(kw.get('query_params') or [])
+        compartment = query.get('compartmentId')
+        page = query.get('page')
+        page = page if isinstance(page, str) else None
+        self.queries.append((op, compartment, page))
+        if op == 'launch_instance':
+            assert method == 'POST'
+            body = kw['body']
+            assert isinstance(body, M.LaunchInstanceDetails)
+            assert body.compartment_id == TARGET and body.availability_domain == AD
+            assert body.shape in (ARM, AMD)
+            assert body.capacity_reservation_id == ''
+            assert body.create_vnic_details.subnet_id == 'ocid1.subnet.oc1.ap-kulai-2.fake'
+            assert body.create_vnic_details.assign_public_ip is True
+            assert body.source_details.boot_volume_size_in_gbs == 50
+            assert body.source_details.boot_volume_vpus_per_gb == 10
+            assert body.source_details.image_id == image(body.shape).id
+            if body.shape == ARM:
+                assert body.shape_config.ocpus == 2 and body.shape_config.memory_in_gbs == 12
+            else:
+                assert body.shape_config is None
+            assert kw['header_params']['opc-retry-token']
+            assert os.environ['HUNT_DIAGNOSTIC_LOCK'] == 'false'
+            assert os.environ.get('HUNT_DIAGNOSTIC_ONLY') != 'true'
+            self.creates.append(body)
+            result = self.launches.pop(0) if self.launches else instance(body.shape)
+        else:
+            assert method == 'GET', 'No unplanned writes'
+            key = (op, compartment, page)
+            if key in self.overrides or op in self.overrides:
+                result = self.overrides.get(key, self.overrides.get(op))
+                if callable(result):
+                    result = result(query, kw)
+            elif op == 'list_instances':
+                if compartment == TARGET:
+                    if page is None:
+                        self.target_round += 1
+                    result = self.targets[min(self.target_round, len(self.targets) - 1)]
+                else:
+                    result = []
+            elif op == 'list_region_subscriptions':
+                result = [oci.identity.models.RegionSubscription(region_name=REGION, is_home_region=True)]
+            elif op == 'list_availability_domains':
+                result = [oci.identity.models.AvailabilityDomain(name=AD)]
+            elif op == 'get_subnet':
+                result = M.Subnet(id='ocid1.subnet.oc1.ap-kulai-2.fake', lifecycle_state='AVAILABLE',
+                                  prohibit_public_ip_on_vnic=False)
+            elif op == 'list_compartments':
+                assert query['compartmentIdInSubtree'] is True and query['accessLevel'] == 'ANY'
+                result = [oci.identity.models.Compartment(id=TARGET, lifecycle_state='ACTIVE')]
+            elif op in ('list_volumes', 'list_boot_volumes'):
+                if op == 'list_boot_volumes':
+                    assert query['availabilityDomain'] == AD
+                result = []
+            elif op == 'list_images':
+                self.image_shapes.append(query['shape'])
+                assert query['operatingSystem'] == 'Canonical Ubuntu'
+                assert query['sortBy'] == 'TIMECREATED' and query['sortOrder'] == 'DESC'
+                result = [image(query['shape'])]
+            elif op == 'get_image':
+                result = image(AMD if kw['path_params']['imageId'].endswith('amd') else ARM)
+            elif op == 'get_image_shape_compatibility_entry':
+                result = M.ImageShapeCompatibilityEntry(image_id=kw['path_params']['imageId'],
+                                                        shape=kw['path_params']['shapeName'])
+            else:
+                raise AssertionError('Unexpected SDK operation')
+        if isinstance(result, Exception):
+            raise result
+        if isinstance(result, oci.response.Response):
+            return result
+        return response(list(result) if isinstance(result, tuple) else result)
+
+    def command(self, args, **kw):
+        try:
+            assert kw['capture_output'] is True and kw['text'] is True
+            if args[1:4] == ['-m', 'pip', 'install']:
+                assert args[-1] == 'oci==2.187.2'
+                return subprocess.CompletedProcess(args, 0, '', '')
+            assert args[:3] == ['curl', '--config', '-'], 'Unplanned external process'
+            assert MARKER not in ' '.join(args)
+            assert os.environ['HUNT_DIAGNOSTIC_LOCK'] == 'false'
+            assert os.environ.get('HUNT_DIAGNOSTIC_ONLY') != 'true'
+            config = kw['input']
             if '/disable' in config:
-                self.disables.append(config)
+                self.disables.append(True)
                 self.events.append('disable')
-                if self.disable_status == 'timeout':
-                    raise subprocess.TimeoutExpired(command, 25)
+                assert args[args.index('--request') + 1] == 'PUT'
                 assert '/actions/workflows/hunt-free-vm.yml/disable' in config
-                assert command[command.index('--request') + 1] == 'PUT'
-                return subprocess.CompletedProcess(command, 0, '\n' + str(self.disable_status), '')
+                return subprocess.CompletedProcess(args, 0, '\n' + str(self.disable_status), '')
             assert '/sendMessage' in config
-            assert command[command.index('--request') + 1] == 'POST'
             payload = next(line[7:] for line in config.splitlines() if line.startswith('data = '))
             message = json.loads(json.loads(payload))['text']
-            assert SENSITIVE not in message
-            assert 'ocid1.' not in message
+            assert MARKER not in message and 'ocid1.' not in message
             self.notifications.append(message)
             self.events.append('notify')
-            response = self.overrides.get('notify_responses', [])
-            if response:
-                outcome = response.pop(0)
-                if outcome == 'timeout':
-                    raise subprocess.TimeoutExpired(command, 25)
-                return subprocess.CompletedProcess(command, 0, outcome, '')
-            return subprocess.CompletedProcess(command, 0, '{"ok":true}\n200', '')
-        if command[0] != 'oci':
-            self.unexpected.append(command[0])
-            raise AssertionError('Unexpected external command')
-        assert command[command.index('--region') + 1] == REGION
-        assert '--no-retry' in command
-        assert '--debug' not in command
-        args = command[10:]
-        # Exact prefix: oci --region R --no-retry --connection-timeout 10 --read-timeout 30 --output json
-        operation = tuple(args[:3])
-        if operation == self.overrides.get('operation_failure'):
-            outcome = self.overrides['operation_outcome']
-            if isinstance(outcome, Exception):
-                raise outcome
-            return outcome
-        if args[-1:] == ['--all']:
-            assert '--limit' not in args
-        elif operation[2] == 'list':
-            raise AssertionError('List must fetch every page')
-        if operation == ('compute', 'instance', 'list'):
-            compartment = args[args.index('--compartment-id') + 1]
-            if compartment == COMPARTMENT:
-                self.target_queries += 1
-                if self.query_error:
-                    return self.query_error
-                # Simulate the CLI --all aggregation of multiple service pages.
-                index = min(self.target_queries - 1, len(self.target_lists) - 1)
-                outcome = self.target_lists[index]
-                self.events.append('query')
-                if isinstance(outcome, Exception):
-                    raise outcome
-                if isinstance(outcome, subprocess.CompletedProcess):
-                    return outcome
-                data = list(outcome)
-            else:
-                data = self.overrides.get('other_instances', [])
-        elif operation == ('iam', 'region-subscription', 'list'):
-            data = [{'region-name': self.overrides.get('home', REGION), 'is-home-region': True}]
-        elif operation == ('iam', 'availability-domain', 'list'):
-            self.events.append('ad')
-            if self.overrides.get('ad_failure'):
-                return service_error(429, 'TooManyRequests', 'mock discovery failure')
-            data = [{'name': AD}]
-        elif operation == ('network', 'subnet', 'get'):
-            data = {'id': os.environ['OCI_SUBNET_ID'], 'lifecycle-state': 'AVAILABLE', 'availability-domain': None,
-                    'prohibit-public-ip-on-vnic': False}
-            data.update(self.overrides.get('subnet', {}))
-            if self.overrides.get('subnet_missing_public_ip_field'):
-                data.pop('prohibit-public-ip-on-vnic')
-        elif operation == ('iam', 'compartment', 'list'):
-            assert '--include-root' in args
-            assert args[args.index('--compartment-id-in-subtree') + 1] == 'true'
-            assert args[args.index('--access-level') + 1] == 'ANY'
-            data = [{'id': TENANCY, 'lifecycle-state': 'ACTIVE'}, {'id': COMPARTMENT, 'lifecycle-state': 'ACTIVE'}]
-        elif operation in (('bv', 'volume', 'list'), ('bv', 'boot-volume', 'list')):
-            data = []
-            if operation == ('bv', 'boot-volume', 'list') and args[args.index('--compartment-id') + 1] == TENANCY:
-                data = self.overrides.get('volumes', [])
-        elif operation in (('compute', 'image', 'list'), ('compute', 'image', 'get')):
-            shape = args[args.index('--shape') + 1] if '--shape' in args else next(k for k, v in IMAGES.items() if v == args[args.index('--image-id') + 1])
-            self.events.append('image:' + shape)
-            if self.overrides.get('image_failure') == shape:
-                return service_error(self.overrides.get('image_failure_status', 401), 'MockDiscoveryFailure', 'mock discovery failure')
-            data = {'id': IMAGES[shape], 'compartment-id': None, 'operating-system': 'Canonical Ubuntu',
-                    'operating-system-version': '24.04', 'lifecycle-state': 'AVAILABLE', 'size-in-mbs': 25600,
-                    'display-name': 'Canonical-Ubuntu-24.04' + ('-aarch64' if shape == ARM else '') + '-2026.09.18-0'}
-            data.update(self.overrides.get('image', {}))
-            if operation[2] == 'list':
-                data = [data]
-        elif operation == ('compute', 'image-shape-compatibility-entry', 'get'):
-            data = {'image-id': args[args.index('--image-id') + 1], 'shape': args[args.index('--shape-name') + 1]}
-        elif operation == ('compute', 'instance', 'launch'):
-            assert os.environ.get('HUNT_DIAGNOSTIC_LOCK', 'true') == 'false' and os.environ.get('HUNT_DIAGNOSTIC_ONLY') != 'true', 'Diagnostic mode must never launch'
-            self.creates.append(command)
-            self.events.append('launch')
-            assert self.events.count('image:' + ARM) == 1
-            assert self.events.count('image:' + AMD) == 1
-            assert self.events.index('image:' + AMD) < self.events.index('query')
-            shape = args[args.index('--shape') + 1]
-            assert shape in (ARM, AMD)
-            assert args[args.index('--availability-domain') + 1] == AD
-            assert args[args.index('--subnet-id') + 1] == os.environ['OCI_SUBNET_ID']
-            assert args[args.index('--compartment-id') + 1] == COMPARTMENT
-            source = json.loads(args[args.index('--source-details') + 1])
-            assert source == {'sourceType': 'image', 'imageId': IMAGES[shape], 'bootVolumeSizeInGBs': 50, 'bootVolumeVpusPerGB': 10}
-            assert args[args.index('--assign-public-ip') + 1] == 'true'
-            assert args[args.index('--capacity-reservation-id') + 1] == ''
-            assert '--wait-for-state' not in args
-            if shape == ARM:
-                assert json.loads(args[args.index('--shape-config') + 1]) == {'ocpus': 2, 'memoryInGBs': 12}
-            else:
-                assert '--shape-config' not in args
-            assert self.launches, 'Unexpected additional creation'
-            outcome = self.launches.pop(0)
-            if outcome == 'timeout':
-                raise subprocess.TimeoutExpired(command, 90)
-            if isinstance(outcome, Exception):
-                raise outcome
-            if isinstance(outcome, subprocess.CompletedProcess):
-                return outcome
-            data = outcome
-        else:
-            self.unexpected.append(operation)
-            raise AssertionError('Unmocked OCI operation')
-        # oci-cli 3.94.2 render() emits no JSON when data is falsy and no display header remains.
-        if isinstance(data, list) and not data:
-            self.blank_list_responses += 1
-            rendered = ''
-        else:
-            rendered = json.dumps({'data': data})
-        return subprocess.CompletedProcess(command, 0, rendered, '')
-
-    @staticmethod
-    def assert_capture(kwargs):
-        assert kwargs.get('capture_output') is True
-        assert kwargs.get('text') is True
-        assert kwargs.get('timeout') in (25, 60, 90, 180)
+            return subprocess.CompletedProcess(args, 0, json.dumps({'ok': self.notify_ok}) + '\n200', '')
+        except AssertionError:
+            self.unexpected.append('external contract violation')
+            raise
 
 
-def run_case(mock, environment=None):
-    env = {
-        'HUNT_DIAGNOSTIC_LOCK': 'false',  # Explicitly test the preserved normal path after lock release.
-        'OCI_CLI_TENANCY': TENANCY, 'OCI_CLI_USER': 'mock-user', 'OCI_CLI_FINGERPRINT': 'mock-fingerprint',
-        'OCI_CLI_KEY_CONTENT': SENSITIVE, 'OCI_COMPARTMENT_ID': COMPARTMENT,
-        'OCI_SUBNET_ID': 'ocid1.subnet.oc1.ap-kulai-2.mock', 'SSH_PUBLIC_KEY': 'ssh-ed25519 bW9jaw==',
-        'TG_BOT_TOKEN': SENSITIVE, 'TG_CHAT_ID': 'mock-chat', 'GITHUB_TOKEN': SENSITIVE,
-        'GITHUB_REPOSITORY': 'mock-owner/mock-repo',
-        'GITHUB_WORKFLOW_REF': 'mock-owner/mock-repo/.github/workflows/hunt-free-vm.yml@refs/heads/main',
-    }
-    env.update(environment or {})
-    env = {key: value for key, value in env.items() if value is not None}
-    output = io.StringIO()
-    stderr = io.StringIO()
-    with tempfile.TemporaryDirectory(prefix='oci-offline-') as home:
-        env.update({'HOME': home, 'TMPDIR': home, 'OCI_CLI_CONFIG_FILE': str(Path(home) / 'absent-config')})
-        # Force tempfile isolation as well as credential/environment isolation.
-        with patch.object(tempfile, 'tempdir', home), patch.dict(os.environ, env, clear=True), \
-                patch('subprocess.run', side_effect=mock), contextlib.redirect_stdout(output), contextlib.redirect_stderr(stderr):
+class Acceptance(unittest.TestCase):
+    def run_case(self, fake=None, unmock_signer=False, **extra):
+        fake = fake or FakeIO()
+        with tempfile.TemporaryDirectory(prefix='oci-sdk-test-') as home:
+            env = dict(HOME=home, PATH=os.defpath, HUNT_DIAGNOSTIC_LOCK='false', HUNT_DIAGNOSTIC_ONLY='false',
+                       OCI_CLI_TENANCY=TENANCY, OCI_CLI_USER='ocid1.user.oc1..fake',
+                       OCI_CLI_FINGERPRINT=':'.join(['aa'] * 16), OCI_CLI_KEY_CONTENT=MARKER,
+                       OCI_COMPARTMENT_ID=TARGET, OCI_SUBNET_ID='ocid1.subnet.oc1.ap-kulai-2.fake',
+                       SSH_PUBLIC_KEY='ssh-ed25519 RkFLRQ==', TG_BOT_TOKEN=MARKER, TG_CHAT_ID='fake',
+                       GITHUB_TOKEN=MARKER, GITHUB_REPOSITORY='fake/repo',
+                       GITHUB_WORKFLOW_REF='fake/repo/.github/workflows/hunt-free-vm.yml@refs/heads/main')
+            env.update(extra)
+            env = {key: value for key, value in env.items() if value is not None}
+            out, err = io.StringIO(), io.StringIO()
+            old_logging = logging.root.manager.disable
             try:
-                exec(compile(SOURCE, str(WORKFLOW), 'exec'), {'__name__': '__main__'})
-                status = 0
-            except SystemExit as exit_result:
-                status = exit_result.code
-        assert not mock.unexpected, 'Unknown external call was blocked'
-        assert SENSITIVE not in output.getvalue() + stderr.getvalue()
-        assert 'ocid1.' not in output.getvalue() + stderr.getvalue()
-        assert all(not path.exists() for path in mock.secret_files), 'Temporary credentials were not removed'
-    return status, output.getvalue() + stderr.getvalue()
+                signer_patch = (patch('oci.signer.Signer', return_value=oci.signer.AbstractBaseSigner())
+                                if not unmock_signer else contextlib.nullcontext())
+                with patch.dict(os.environ, env, clear=True), \
+                     patch('subprocess.run', side_effect=fake.command), \
+                     signer_patch, \
+                     patch('oci.base_client.BaseClient.call_api', autospec=True, side_effect=fake.api), \
+                     patch('oci.config.from_file', side_effect=AssertionError('No config reads')), \
+                     patch('oci._vendor.requests.sessions.Session.request', side_effect=AssertionError('No real HTTP')), \
+                     patch.object(socket.socket, 'connect', side_effect=AssertionError('No network')), \
+                     patch('oci.retry.NoneRetryStrategy.make_retrying_call', autospec=True,
+                           side_effect=lambda self, fn, *a, **k: fn(*a, **k)) as retry, \
+                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    try:
+                        exec(compile(SOURCE, 'workflow-production', 'exec'), {'__name__': '__main__'})
+                    except SystemExit as e:
+                        status = e.code
+                    else:
+                        status = 0
+                    # Credential-construction failures stop before any SDK call by design;
+                    # test_29 asserts that path directly. Every other run must reach the SDK.
+                    self.assertTrue(retry.called or unmock_signer)
+            finally:
+                logging.disable(old_logging)
+            self.assertEqual(fake.unexpected, [])
+            self.assertNotIn(MARKER, out.getvalue() + err.getvalue())
+            self.assertEqual(err.getvalue(), '')
+            self.assertEqual(list(Path(home).iterdir()), [])
+            return fake, status, out.getvalue()
 
+    def stopped(self, fake, expected=1):
+        f, status, output = self.run_case(fake)
+        self.assertEqual(status, expected)
+        self.assertEqual(len(f.disables), 1)
+        self.assertTrue(f.notifications)
+        self.assertLess(f.events.index('notify'), f.events.index('disable'))
+        return f, output
 
-class OfflineAcceptance(unittest.TestCase):
-    def assert_counts(self, mock, creates, notices, disables):
-        self.assertEqual((len(mock.creates), len(mock.notifications), len(mock.disables)), (creates, notices, disables))
-        if disables:
-            expected = ['notify', 'disable'] + (['notify'] if notices == 2 else [])
-            self.assertEqual([event for event in mock.events if event in ('notify', 'disable')], expected)
+    def test_01_workflow_contract(self):
+        doc = yaml.load(TEXT, Loader=yaml.BaseLoader)
+        self.assertNotIn('schedule', doc['on'])
+        self.assertEqual(doc['permissions'], {'actions': 'write'})
+        self.assertEqual(doc['concurrency'], {'group': 'oracle-free-vm-hunt', 'cancel-in-progress': 'false'})
+        self.assertEqual(doc['jobs']['hunt']['env']['HUNT_DIAGNOSTIC_LOCK'], 'true')
+        self.assertNotIn("['oci',", SOURCE)
+        self.assertNotIn('tempfile', SOURCE)
 
-    def test_1_arm_success(self):
-        mock = MockCommands(launches=[instance()])
-        status, _ = run_case(mock)
-        self.assertEqual(status, 0)
-        self.assert_counts(mock, 1, 1, 1)
-        self.assertEqual(mock.target_queries, 2)
-        self.assertEqual(mock.events[-2:], ['notify', 'disable'])
-        self.assertIn('ARM 2 OCPU / 12 GB', mock.notifications[0])
-        self.assertRegex(TEXT, r"cron: '\*/15 \* \* \* \*'")
-        self.assertIn('cancel-in-progress: false', TEXT)
-        self.assertIn('actions: write', TEXT)
-        self.assertNotRegex(TEXT, r'(?m)^\s*(pull_request|pull_request_target|push):')
-        self.assertNotIn('set -x', TEXT)
-        self.assertEqual(len(list((ROOT / '.github/workflows').glob('*.yml'))), 1)
-        self.assertEqual(len(list((ROOT / '.github/workflows').glob('*.yaml'))), 0)
-
-    def test_2_arm_capacity_amd_success(self):
-        mock = MockCommands(launches=[CAPACITY, instance(AMD)])
-        self.assertEqual(run_case(mock)[0], 0)
-        self.assert_counts(mock, 2, 1, 1)
-        self.assertEqual([c[c.index('--shape') + 1] for c in mock.creates], [ARM, AMD])
-        self.assertIn('AMD Micro fallback', mock.notifications[0])
-
-    def test_3_all_capacity_silent(self):
-        mock = MockCommands(launches=[CAPACITY, CAPACITY])
-        status, output = run_case(mock)
-        self.assertEqual(status, 0)
-        self.assertEqual(output, '')
-        self.assert_counts(mock, 2, 0, 0)
-
-    def test_4_existing_instances(self):
+    def test_02_existing_states(self):
         for shape in (ARM, AMD):
-            for state in ('RUNNING', 'PROVISIONING'):
+            for state in ('RUNNING', 'PROVISIONING', 'STARTING', 'STOPPING', 'STOPPED', 'MOVING', 'TERMINATING'):
                 with self.subTest(shape=shape, state=state):
-                    mock = MockCommands(target_lists=[[instance(AMD, 'TERMINATED'), instance(shape, state)]])
-                    self.assertEqual(run_case(mock)[0], 0)
-                    self.assert_counts(mock, 0, 1, 1)
-                    self.assertEqual(mock.target_queries, 1)
-                    self.assertIn(shape, mock.notifications[0])
-                    self.assertIn(state, mock.notifications[0])
-                    self.assertEqual(mock.events[-2:], ['notify', 'disable'])
-        with self.subTest(state='TERMINATING'):
-            mock = MockCommands(target_lists=[[instance(state='TERMINATING')]])
-            status, output = run_case(mock)
-            self.assertEqual(status, 0)
-            self.assert_counts(mock, 0, 1, 1)
-            self.assertIn(ARM, mock.notifications[0])
-            self.assertIn('TERMINATING', mock.notifications[0])
-            self.assertEqual(mock.events[-2:], ['notify', 'disable'])
+                    f, _ = self.stopped(FakeIO(targets=([instance(shape, state)],)), 0)
+                    self.assertFalse(f.creates)
+                    self.assertEqual(f.events[0], 'list_instances')
 
-    def test_5_exception_branches(self):
-        error = service_error(401, 'NotAuthenticated', 'mock authentication failure')
-        with self.subTest(branch='query failed'):
-            mock = MockCommands(query_error=error)
-            self.assertEqual(run_case(mock)[0], 1)
-            self.assert_counts(mock, 0, 1, 1)
-        for final_inventory in ([], [instance()], 'failed'):
-            with self.subTest(branch='timeout', final_inventory=final_inventory):
-                mock = MockCommands(launches=['timeout'], target_lists=[[], [], final_inventory if final_inventory != 'failed' else []])
-                original = mock.__class__.__call__
-                if final_inventory == 'failed':
-                    def failing_requery(command, **kwargs):
-                        if 'instance' in command and 'list' in command and '--compartment-id' in command \
-                                and command[command.index('--compartment-id') + 1] == COMPARTMENT and mock.target_queries >= 2:
-                            mock.target_queries += 1
-                            return error
-                        return original(mock, command, **kwargs)
-                    with patch.object(mock.__class__, '__call__', side_effect=failing_requery):
-                        status, _ = run_case(mock)
-                else:
-                    status, _ = run_case(mock)
-                self.assertEqual(status, 0 if final_inventory == [instance()] else 1)
-                self.assert_counts(mock, 1, 1, 1)
-                self.assertEqual(mock.target_queries, 3)
-        for rejection in (error, service_error(403, 'NotAuthorizedOrNotFound', 'mock permission failure'),
-                          service_error(400, 'LimitExceeded', 'mock quota exceeded')):
-            with self.subTest(branch='create rejection', http_status=json.loads(rejection.stderr.split('\n', 1)[1])['status']):
-                mock = MockCommands(launches=[rejection])
-                self.assertEqual(run_case(mock)[0], 1)
-                self.assert_counts(mock, 1, 1, 1)
-                self.assertEqual(mock.target_queries, 2)
-        with self.subTest(branch='unconfirmed success response'):
-            mock = MockCommands(launches=[{}])
-            self.assertEqual(run_case(mock)[0], 1)
-            self.assert_counts(mock, 1, 1, 1)
-            self.assertEqual(mock.target_queries, 3)
-        with self.subTest(branch='query 429 silent'):
-            mock = MockCommands(query_error=service_error(429, 'TooManyRequests', 'mock rate limit'))
-            self.assertEqual(run_case(mock), (0, ''))
-            self.assert_counts(mock, 0, 0, 0)
-        with self.subTest(branch='429 silent'):
-            mock = MockCommands(launches=[service_error(429, 'TooManyRequests', 'mock rate limit')])
-            self.assertEqual(run_case(mock), (0, ''))
-            self.assert_counts(mock, 1, 0, 0)
-        with self.subTest(branch='disable requires 204'):
-            mock = MockCommands(launches=[instance()], disable_status=200)
-            self.assertEqual(run_case(mock)[0], 1)
-            self.assert_counts(mock, 1, 2, 1)
-            self.assertEqual(mock.notifications[1], 'OCI hunt v3.1: 自动禁用失败，请手动去 Actions 页 Disable workflow')
-            self.assertEqual(mock.events[-3:], ['notify', 'disable', 'notify'])
-        for overrides in (
-                {'home': 'ap-singapore-1'},
-                {'subnet_missing_public_ip_field': True},
-                {'subnet': {'prohibit-public-ip-on-vnic': True}},
-                {'subnet': {'prohibit-public-ip-on-vnic': None}},
-                {'subnet': {'prohibit-public-ip-on-vnic': 'false'}},
-                {'volumes': [{'size-in-gbs': 151, 'lifecycle-state': 'AVAILABLE'}]},
-                {'other_instances': [instance()]},
-                {'image': {'compartment-id': COMPARTMENT}},
-                {'image': {'size-in-mbs': 60 * 1024}}):
-            with self.subTest(branch='free eligibility/configuration', overrides=overrides):
-                mock = MockCommands(overrides=overrides)
-                self.assertEqual(run_case(mock)[0], 1)
-                self.assert_counts(mock, 0, 1, 1)
-        with self.subTest(branch='ambiguous 500 capacity wording'):
-            mock = MockCommands(launches=[service_error(500, 'InternalError', 'Request failed; maybe out of host capacity')])
-            self.assertEqual(run_case(mock)[0], 1)
-            self.assert_counts(mock, 1, 1, 1)
-        with self.subTest(branch='explicit image override'):
-            mock = MockCommands(launches=[instance()])
-            self.assertEqual(run_case(mock, {'IMAGE_ID_ARM': IMAGE})[0], 0)
-            self.assert_counts(mock, 1, 1, 1)
+    def test_03_arm_success(self):
+        f, _ = self.stopped(FakeIO(), 0)
+        self.assertEqual([x.shape for x in f.creates], [ARM])
+        self.assertEqual(f.image_shapes, [ARM])
 
-    def test_6_disable_and_notification_failures(self):
-        for disabled in (200, 202, 403, 500, 'timeout'):
-            with self.subTest(disable=disabled):
-                mock = MockCommands(launches=[instance()], disable_status=disabled)
-                self.assertEqual(run_case(mock)[0], 1)
-                self.assert_counts(mock, 1, 2, 1)
-                self.assertEqual(mock.events[-3:], ['notify', 'disable', 'notify'])
-                self.assertIn('ARM 2 OCPU / 12 GB', mock.notifications[0])
-                self.assertEqual(mock.notifications[1], 'OCI hunt v3.1: 自动禁用失败，请手动去 Actions 页 Disable workflow')
-        for response in ('{"ok":false}\n500', 'invalid-json\n200', 'timeout'):
-            with self.subTest(initial_notification=response):
-                mock = MockCommands(launches=[instance()], overrides={'notify_responses': [response]})
-                status, output = run_case(mock)
-                self.assertEqual(status, 1)
-                self.assert_counts(mock, 1, 1, 1)
-                self.assertEqual(mock.events[-2:], ['notify', 'disable'])
-                self.assertIn('Telegram delivery failed', output)
-        for responses in (['{"ok":true}\n200', 'timeout'], ['timeout', 'timeout']):
-            with self.subTest(additional_notification=responses):
-                mock = MockCommands(launches=[instance()], disable_status=403,
-                                    overrides={'notify_responses': list(responses)})
-                status, output = run_case(mock)
-                self.assertEqual(status, 1)
-                self.assert_counts(mock, 1, 2, 1)
-                self.assertEqual(mock.events[-3:], ['notify', 'disable', 'notify'])
-                self.assertIn('manually disable workflow', output)
-                self.assertIn('Telegram delivery failed', output)
-        with self.subTest(initial_exception_alert='disable failed'):
-            mock = MockCommands(query_error=service_error(401, 'NotAuthenticated', 'mock'), disable_status=500)
-            self.assertEqual(run_case(mock)[0], 1)
-            self.assert_counts(mock, 0, 2, 1)
-            self.assertEqual(mock.events[-3:], ['notify', 'disable', 'notify'])
+    def test_04_amd_only_after_capacity(self):
+        f, _ = self.stopped(FakeIO(launches=[capacity(), instance(AMD)]), 0)
+        self.assertEqual([x.shape for x in f.creates], [ARM, AMD])
+        self.assertEqual(len({x.availability_domain for x in f.creates}), 1)
 
-    def test_7_discovery_before_queries_and_creation(self):
-        mock = MockCommands(launches=[CAPACITY, instance(AMD)])
-        self.assertEqual(run_case(mock)[0], 0)
-        self.assertEqual(mock.events.count('image:' + ARM), 1)
-        self.assertEqual(mock.events.count('image:' + AMD), 1)
-        self.assertLess(mock.events.index('install'), mock.events.index('ad'))
-        self.assertLess(mock.events.index('ad'), mock.events.index('image:' + ARM))
-        self.assertLess(mock.events.index('image:' + ARM), mock.events.index('query'))
-        self.assertLess(mock.events.index('image:' + AMD), mock.events.index('query'))
-        self.assert_counts(mock, 2, 1, 1)
-        for shape in (ARM, AMD):
-            for status in (401, 429):
-                with self.subTest(failed_image=shape, http_status=status):
-                    mock = MockCommands(overrides={'image_failure': shape, 'image_failure_status': status})
-                    self.assertEqual(run_case(mock)[0], 1)
-                    self.assert_counts(mock, 0, 1, 1)
-                    self.assertEqual(mock.target_queries, 0)
-                    self.assertEqual(mock.events[-2:], ['notify', 'disable'])
-        mock = MockCommands(overrides={'ad_failure': True})
-        self.assertEqual(run_case(mock)[0], 1)
-        self.assert_counts(mock, 0, 1, 1)
-        self.assertEqual(mock.target_queries, 0)
-        with self.subTest(distinct_overrides=True):
-            mock = MockCommands(launches=[CAPACITY, instance(AMD)])
-            self.assertEqual(run_case(mock, {'IMAGE_ID_ARM': IMAGES[ARM], 'IMAGE_ID_AMD': IMAGES[AMD]})[0], 0)
-            self.assert_counts(mock, 2, 1, 1)
-
-    def test_8_uncertain_creation_requery_rate_limit(self):
-        for final in (service_error(429, 'TooManyRequests', 'mock'), OSError('mock connection failure'),
-                      [instance(AMD, 'TERMINATING')]):
-            with self.subTest(final_type=type(final).__name__):
-                mock = MockCommands(launches=['timeout'], target_lists=[[], [], final])
-                self.assertEqual(run_case(mock)[0], 0 if isinstance(final, list) else 1)
-                self.assert_counts(mock, 1, 1, 1)
-                self.assertEqual(mock.target_queries, 3)
-                self.assertEqual(mock.events[-2:], ['notify', 'disable'])
-                if isinstance(final, list):
-                    self.assertIn(AMD, mock.notifications[0])
-                    self.assertIn('TERMINATING', mock.notifications[0])
-
-    def test_9_invalid_responses_fail_closed(self):
-        invalid_json = subprocess.CompletedProcess([], 0, 'invalid-json', '')
-        missing_data = subprocess.CompletedProcess([], 0, '{}', '')
-        for query in (invalid_json, missing_data, [{}], [instance(state='UNKNOWN')], OSError('mock connection failure')):
-            with self.subTest(query_type=type(query).__name__, query_variant=str(query)[:24]):
-                mock = MockCommands(target_lists=[query])
-                self.assertEqual(run_case(mock)[0], 1)
-                self.assert_counts(mock, 0, 1, 1)
-                self.assertEqual(mock.target_queries, 1)
-        for launch in (invalid_json, missing_data, {}, OSError('mock connection failure')):
-            with self.subTest(launch_type=type(launch).__name__):
-                mock = MockCommands(launches=[launch])
-                self.assertEqual(run_case(mock)[0], 1)
-                self.assert_counts(mock, 1, 1, 1)
-                self.assertEqual(mock.target_queries, 3)
-        for query in (invalid_json, missing_data, [{}]):
-            with self.subTest(requery_type=type(query).__name__):
-                mock = MockCommands(launches=['timeout'], target_lists=[[], [], query])
-                self.assertEqual(run_case(mock)[0], 1)
-                self.assert_counts(mock, 1, 1, 1)
-                self.assertEqual(mock.target_queries, 3)
-
-    def test_10_exact_workflow_structure(self):
-        # Anchored top-level mapping, exact keys/values, no substring-only acceptance.
-        block = re.search(r'(?m)^concurrency:\n((?:[ ]+[^\n]*\n)+)', TEXT)
-        self.assertIsNotNone(block)
-        pairs = {}
-        for line in block[1].splitlines():
-            match = re.fullmatch(r'  ([a-z-]+): ([^#]+)', line)
-            self.assertIsNotNone(match)
-            self.assertNotIn(match[1], pairs)
-            pairs[match[1]] = match[2].strip()
-        self.assertEqual(pairs, {'group': 'oracle-free-vm-hunt', 'cancel-in-progress': 'false'})
-        self.assertEqual(len(re.findall(r'(?m)^concurrency:', TEXT)), 1)
-
-
-    def test_11_diagnostic_mode_never_mutates(self):
-        mode = {'HUNT_DIAGNOSTIC_ONLY': 'true'}
-        for targets in ([], [instance()], [instance(AMD, 'TERMINATING')]):
-            with self.subTest(existing=bool(targets)):
-                mock = MockCommands(target_lists=[targets])
-                status, output = run_case(mock, mode)
-                self.assertEqual(status, 0)
-                self.assert_counts(mock, 0, 0, 0)
-                self.assertEqual(mock.target_queries, 1)
-                self.assertEqual(mock.events.count('image:' + ARM), 1)
-                self.assertEqual(mock.events.count('image:' + AMD), 1)
-                self.assertIn('Diagnostic-only complete', output)
-        for query in (service_error(429, 'TooManyRequests', SENSITIVE),
-                      service_error(401, 'NotAuthenticated', SENSITIVE),
-                      OSError(SENSITIVE), [{}]):
-            with self.subTest(query_type=type(query).__name__):
-                mock = MockCommands(target_lists=[query])
-                status, output = run_case(mock, mode)
-                self.assertEqual(status, 1)
-                self.assert_counts(mock, 0, 0, 0)
-                self.assertIn('stage=target_instances', output)
-        mock = MockCommands(overrides={'home': 'invalid-region'})
-        self.assertEqual(run_case(mock, mode)[0], 1)
-        self.assert_counts(mock, 0, 0, 0)
-        # Independent launch guard, even if a future caller bypasses the main-mode branch.
-        namespace = {}
-        prefix = SOURCE.split("\ntry:\n    need(env.get('HUNT_DIAGNOSTIC_ONLY'", 1)[0]
-        with patch.dict(os.environ, mode, clear=True), patch('subprocess.run') as external:
-            exec(compile(prefix, str(WORKFLOW), 'exec'), namespace)
-            with self.assertRaises(namespace['Halt']):
-                namespace['oci']('compute', 'instance', 'launch', '--shape', ARM, launch=True)
-            external.assert_not_called()
-
-    def test_12_fixed_stage_and_error_categories(self):
-        stages = {
-            ('iam', 'region-subscription', 'list'): 'region_subscription',
-            ('iam', 'availability-domain', 'list'): 'availability_domains',
-            ('network', 'subnet', 'get'): 'subnet',
-            ('iam', 'compartment', 'list'): 'compartments',
-            ('bv', 'volume', 'list'): 'block_volumes',
-            ('bv', 'boot-volume', 'list'): 'boot_volumes',
-            ('compute', 'instance', 'list'): 'other_instances',
-        }
-        for operation, stage_name in stages.items():
-            for mode in ('true', 'false'):
-                with self.subTest(stage=stage_name, diagnostic=mode):
-                    mock = MockCommands(overrides={'operation_failure': operation,
-                        'operation_outcome': service_error(403, SENSITIVE, SENSITIVE)})
-                    status, output = run_case(mock, {'HUNT_DIAGNOSTIC_ONLY': mode})
-                    self.assertEqual(status, 1)
-                    self.assert_counts(mock, 0, 0 if mode == 'true' else 1, 0 if mode == 'true' else 1)
-                    self.assertIn('stage=' + stage_name + ' category=authorization http=403', output)
-        outcomes = [(service_error(401, 'NotAuthenticated', SENSITIVE), 'authentication', '401'),
-                    (service_error(429, 'TooManyRequests', SENSITIVE), 'rate_limit', '429'),
-                    (service_error(400, 'LimitExceeded', SENSITIVE), 'quota', '400'),
-                    (service_error(500, SENSITIVE, SENSITIVE), 'service_error', '500'),
-                    (service_error(None, SENSITIVE, SENSITIVE), 'cli_error', 'none'),
-                    (subprocess.TimeoutExpired(['mock'], 60, output=SENSITIVE, stderr=SENSITIVE), 'timeout', 'none'),
-                    (OSError(SENSITIVE), 'transport', 'none'),
-                    (subprocess.CompletedProcess([], 0, SENSITIVE, SENSITIVE), 'invalid_response', 'none')]
-        for outcome, category, http_status in outcomes:
-            with self.subTest(category=category):
-                mock = MockCommands(overrides={'operation_failure': ('iam', 'region-subscription', 'list'),
-                                              'operation_outcome': outcome})
-                status, output = run_case(mock, {'HUNT_DIAGNOSTIC_ONLY': 'true'})
-                self.assertEqual(status, 1)
-                self.assert_counts(mock, 0, 0, 0)
-                self.assertIn('stage=region_subscription category=' + category + ' http=' + http_status, output)
-        for shape in (ARM, AMD):
-            for mode in ('true', 'false'):
-                mock = MockCommands(overrides={'image_failure': shape})
-                status, output = run_case(mock, {'HUNT_DIAGNOSTIC_ONLY': mode})
-                self.assertEqual(status, 1)
-                self.assert_counts(mock, 0, 0 if mode == 'true' else 1, 0 if mode == 'true' else 1)
-                self.assertIn('stage=image_' + ('arm' if shape == ARM else 'amd') + ' category=authentication http=401', output)
-            mock = MockCommands(overrides={'operation_failure': ('compute', 'image-shape-compatibility-entry', 'get'),
-                                          'operation_outcome': service_error(403, SENSITIVE, SENSITIVE)})
-            status, output = run_case(mock, {'HUNT_DIAGNOSTIC_ONLY': 'true',
-                'IMAGE_ID_ARM' if shape == ARM else 'IMAGE_ID_AMD': IMAGES[shape]})
-            self.assertEqual(status, 1)
-            self.assert_counts(mock, 0, 0, 0)
-            self.assertIn('stage=image_compat_' + ('arm' if shape == ARM else 'amd'), output)
-        for outcome, category in ((OSError(SENSITIVE), 'transport'),
-                                  (subprocess.TimeoutExpired(['mock'], 180, stderr=SENSITIVE), 'timeout'),
-                                  (subprocess.CompletedProcess([], 1, SENSITIVE, SENSITIVE), 'validation_error')):
-            mock = MockCommands(overrides={'install_outcome': outcome})
-            status, output = run_case(mock, {'HUNT_DIAGNOSTIC_ONLY': 'true'})
-            self.assertEqual(status, 1)
-            self.assert_counts(mock, 0, 0, 0)
-            self.assertIn('stage=cli_install category=' + category, output)
-
-    def test_13_untrusted_errors_never_relayed(self):
-        for status in (SENSITIVE, True, {'untrusted': SENSITIVE}, 999):
-            for mode in ('true', 'false'):
-                mock = MockCommands(overrides={'operation_failure': ('iam', 'region-subscription', 'list'),
-                    'operation_outcome': service_error(status, SENSITIVE, SENSITIVE)})
-                result, output = run_case(mock, {'HUNT_DIAGNOSTIC_ONLY': mode})
-                self.assertEqual(result, 1)
-                self.assertIn('category=cli_error http=none', output)
-                self.assert_counts(mock, 0, 0 if mode == 'true' else 1, 0 if mode == 'true' else 1)
-        for payload in (SENSITIVE, 'ServiceError: []', 'ServiceError: null',
-                        'ServiceError: {"status":401,"code":[],"message":{}}'):
-            mock = MockCommands(overrides={'operation_failure': ('iam', 'region-subscription', 'list'),
-                'operation_outcome': subprocess.CompletedProcess([], 1, payload, payload)})
-            status, output = run_case(mock, {'HUNT_DIAGNOSTIC_ONLY': 'true'})
-            self.assertEqual(status, 1)
-            self.assert_counts(mock, 0, 0, 0)
-            self.assertNotIn(payload, output)
-
-    def test_14_diagnostic_selector_structure(self):
-        self.assertRegex(TEXT, r'workflow_dispatch:\n    inputs:\n      diagnostic_only:\n        description: [^\n]+\n        type: boolean\n        default: false')
-        self.assertIn("github.event_name == 'workflow_dispatch' && inputs.diagnostic_only == true && 'true' || 'false'", TEXT)
-        self.assertNotIn('${{ inputs.diagnostic_only }}', SOURCE)
-        self.assertIn("HUNT_DIAGNOSTIC_LOCK: 'true'", TEXT)
-        for event in ('schedule', 'workflow_dispatch'):
-            for lock in ('true', '', 'unexpected', None):
-                mock = MockCommands()
-                status, output = run_case(mock, {'GITHUB_EVENT_NAME': event, 'HUNT_DIAGNOSTIC_LOCK': lock, 'HUNT_DIAGNOSTIC_ONLY': 'false'})
-                self.assertEqual(status, 0)
-                self.assert_counts(mock, 0, 0, 0)
-                self.assertIn('Diagnostic-only complete:', output)
-        for environment in ({}, {'HUNT_DIAGNOSTIC_ONLY': 'false'}):
-            mock = MockCommands(launches=[instance()])
-            self.assertEqual(run_case(mock, environment)[0], 0)
-            self.assert_counts(mock, 1, 1, 1)
-
-
-    def test_15_cli_empty_collection_stdout(self):
-        # Known list --all with exit 0 and blank stdout/stderr is an empty collection, not a query failure.
-        mock = MockCommands(launches=[instance()])
-        self.assertEqual(run_case(mock)[0], 0)
-        self.assertGreater(mock.blank_list_responses, 0)
-        self.assert_counts(mock, 1, 1, 1)
-
-        for stdout, stderr in (('{"data":[]}', ''), ('\n', '\n')):
-            with self.subTest(stdout=stdout, stderr=stderr):
-                rendered = subprocess.CompletedProcess([], 0, stdout, stderr)
-                mock = MockCommands(target_lists=[rendered], launches=[instance()])
-                self.assertEqual(run_case(mock)[0], 0)
-                self.assert_counts(mock, 1, 1, 1)
-
-        noisy = subprocess.CompletedProcess([], 0, '', 'Warning: ' + SENSITIVE)
-        mock = MockCommands(target_lists=[noisy], launches=[instance()])
-        status, output = run_case(mock)
-        self.assertEqual(status, 1)
-        self.assert_counts(mock, 0, 1, 1)
-        self.assertIn('stage=target_instances category=stdout_empty http=none', output)
-
-        header_only = subprocess.CompletedProcess([], 0, '{"opc-total-items":"0"}', '')
-        mock = MockCommands(target_lists=[header_only], launches=[instance()])
-        status, output = run_case(mock)
-        self.assertEqual(status, 1)
-        self.assert_counts(mock, 0, 1, 1)
-        self.assertIn('stage=target_instances category=invalid_response http=none', output)
-
-        mock = MockCommands(launches=[subprocess.CompletedProcess([], 0, '', ''), instance()])
-        status, output = run_case(mock)
-        self.assertEqual(status, 1)
-        self.assert_counts(mock, 1, 1, 1)
-        self.assertEqual(mock.target_queries, 3)
-        self.assertEqual(mock.launches, [instance()])
-        self.assertIn('Launch outcome unknown', mock.notifications[0])
-        self.assertIn('stage=target_instances category=unknown_result http=none', output)
-        # Direct parser check: requery replaces the global stage, so the launch category is asserted here.
-        namespace = {}
-        prefix = SOURCE.split("\ntry:\n    need(env.get('HUNT_DIAGNOSTIC_ONLY'", 1)[0]
-        def blank_success(command, **kwargs):
-            return subprocess.CompletedProcess(command, 0, '', '')
-        with patch.dict(os.environ, {'HUNT_DIAGNOSTIC_LOCK': 'false', 'OCI_COMPARTMENT_ID': COMPARTMENT}, clear=True), \
-                patch('subprocess.run', side_effect=blank_success):
-            exec(compile(prefix, str(WORKFLOW), 'exec'), namespace)
-            self.assertEqual(namespace['oci']('bv', 'volume', 'list', '--compartment-id', COMPARTMENT, '--all'), [])
-            with self.assertRaises(namespace['OciError']) as caught:
-                namespace['oci']('compute', 'instance', 'list', '--compartment-id', COMPARTMENT)
-            self.assertEqual(caught.exception.category, 'stdout_empty')
-            with self.assertRaises(namespace['OciError']) as caught:
-                namespace['oci']('compute', 'instance', 'launch', '--shape', ARM, launch=True)
-            self.assertEqual(caught.exception.category, 'stdout_empty')
-            with self.assertRaises(namespace['OciError']) as caught:
-                namespace['oci']('network', 'subnet', 'get', '--subnet-id', 'mock')
-            self.assertEqual(caught.exception.category, 'stdout_empty')
-
-        mock = MockCommands(overrides={
-            'operation_failure': ('compute', 'image', 'get'),
-            'operation_outcome': subprocess.CompletedProcess([], 0, '', ''),
-        })
-        status, output = run_case(mock, {'IMAGE_ID_ARM': IMAGES[ARM], 'IMAGE_ID_AMD': IMAGES[AMD]})
-        self.assertEqual(status, 1)
-        self.assert_counts(mock, 0, 1, 1)
-        self.assertEqual(mock.target_queries, 0)
-        self.assertIn('stage=image_arm category=stdout_empty http=none', output)
-
-        mock = MockCommands()
-        status, output = run_case(mock, {'HUNT_DIAGNOSTIC_LOCK': 'true'})
+    def test_05_both_capacity(self):
+        f, status, output = self.run_case(FakeIO(launches=[capacity(), capacity()]))
         self.assertEqual(status, 0)
-        self.assertGreater(mock.blank_list_responses, 0)
-        self.assert_counts(mock, 0, 0, 0)
-        self.assertIn('Diagnostic-only complete', output)
+        self.assertIn('capacity_unavailable', output)
+        self.assertEqual(len(f.creates), 2)
+        self.assertFalse(f.disables or f.notifications)
 
-    def test_16_empty_stdout_stderr_is_safely_classified(self):
-        file_permissions = (
-            f'WARNING: Permissions on /mock/{SENSITIVE}/.oci/config are too open.\n'
-            'To fix this please try executing the following command:\n'
-            f'oci setup repair-file-permissions --file /mock/{SENSITIVE}/.oci/config\n'
-            'Alternatively to hide this warning, you may set the environment variable, '
-            'OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING:\n'
-            'export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True'
-        )
-        cases = (
-            ('Query returned empty result, no output to show.', 'query_empty_result_warning'),
-            ('WARNING: This operation supports pagination and not all resources were returned. '
-             'Re-run using the --all option to auto paginate and list all resources.',
-             'pagination_warning'),
-            (file_permissions, 'file_permissions_warning'),
-            ('OCI warning: ' + SENSITIVE, 'unknown'),
-            ('Query returned empty result, no output to show.\n' + SENSITIVE, 'unknown'),
-        )
-        for stderr, expected_kind in cases:
-            with self.subTest(stderr_kind=expected_kind, mixed='\n' in stderr):
-                mock = MockCommands(overrides={
-                    'operation_failure': ('bv', 'volume', 'list'),
-                    'operation_outcome': subprocess.CompletedProcess([], 0, '', stderr),
-                })
-                status, output = run_case(mock, {'HUNT_DIAGNOSTIC_ONLY': 'true'})
+    def test_06_launch_429(self):
+        f, status, _ = self.run_case(FakeIO(launches=[error(429)]))
+        self.assertEqual(status, 0)
+        self.assertEqual(len(f.creates), 1)
+        self.assertFalse(f.disables or f.notifications)
+
+    def test_07_auth_quota_configuration(self):
+        for e in [error(401), error(403), error(400, 'LimitExceeded'), error(400, 'InvalidParameter')]:
+            with self.subTest(status=e.status, code=e.code):
+                f, _ = self.stopped(FakeIO(launches=[e]))
+                self.assertEqual(len(f.creates), 1)
+
+    def test_08_timeout_found(self):
+        f, _ = self.stopped(FakeIO(launches=[oci.exceptions.RequestException(MARKER)],
+                                 targets=[[], [], [instance()]]), 0)
+        self.assertEqual(len(f.creates), 1)
+        self.assertEqual(f.target_round, 2)
+
+    def test_09_timeout_empty(self):
+        f, output = self.stopped(FakeIO(launches=[oci.exceptions.RequestException(MARKER)]))
+        self.assertEqual(len(f.creates), 1)
+        self.assertEqual(f.target_round, 2)
+        self.assertIn('unknown_result', output)
+
+    def test_10_timeout_reconcile_429_alerts_and_disables(self):
+        f, output = self.stopped(FakeIO(launches=[oci.exceptions.RequestException(MARKER)],
+                                      targets=[[], [], error(429)]))
+        self.assertEqual([x.shape for x in f.creates], [ARM])
+        self.assertEqual(f.target_round, 2)  # initial, pre-launch, exactly one reconciliation
+        self.assertEqual(len(f.notifications), 1)
+        self.assertIn('Launch outcome unknown', f.notifications[0])
+        self.assertIn('category=rate_limit http=429', output)
+
+    def test_11_malformed_launch(self):
+        f, _ = self.stopped(FakeIO(launches=[None]))
+        self.assertEqual(len(f.creates), 1)
+        self.assertEqual(f.target_round, 2)
+
+    def test_12_query_failures(self):
+        for op in ['list_instances', 'list_region_subscriptions', 'list_availability_domains',
+                   'get_subnet', 'list_compartments', 'list_volumes', 'list_boot_volumes', 'list_images']:
+            with self.subTest(op=op):
+                f, _ = self.stopped(FakeIO(overrides={op: error(403)}))
+                self.assertFalse(f.creates)
+
+    def test_13_second_instance_page(self):
+        overrides = {('list_instances', TARGET, None): response([], {'opc-next-page': 'next'}),
+                     ('list_instances', TARGET, 'next'): [instance()]}
+        f, _ = self.stopped(FakeIO(overrides=overrides), 0)
+        self.assertFalse(f.creates)
+        self.assertIn(('list_instances', TARGET, 'next'), f.queries)
+
+    def test_14_second_page_failure(self):
+        for op, compartment in [('list_instances', TARGET), ('list_compartments', TENANCY),
+                                ('list_volumes', TENANCY), ('list_boot_volumes', TARGET), ('list_images', TARGET)]:
+            with self.subTest(op=op):
+                f, _ = self.stopped(FakeIO(overrides={(op, compartment, None): response([], {'opc-next-page': 'next'}),
+                                                     (op, compartment, 'next'): error(403)}))
+                self.assertFalse(f.creates)
+
+    def test_15_repeated_page_and_bad_collection(self):
+        for result in [response([], {'opc-next-page': 'same'}), response(None), response({'data': []})]:
+            with self.subTest(kind=type(result.data).__name__):
+                f, _ = self.stopped(FakeIO(overrides={'list_instances': result}))
+                self.assertFalse(f.creates)
+
+    def test_16_other_compartment_and_root(self):
+        for c in [TENANCY, 'ocid1.compartment.oc1..other']:
+            with self.subTest(compartment=c):
+                overrides = {'list_compartments': [oci.identity.models.Compartment(id=TARGET, lifecycle_state='ACTIVE'),
+                                                  oci.identity.models.Compartment(id=c, lifecycle_state='ACTIVE')],
+                             ('list_instances', c, None): [instance()]}
+                f, _ = self.stopped(FakeIO(overrides=overrides))
+                self.assertFalse(f.creates)
+
+    def test_17_total_storage(self):
+        for size, allowed in [(150, True), (151, False)]:
+            with self.subTest(size=size):
+                f, _ = self.stopped(FakeIO(overrides={('list_volumes', TENANCY, None):
+                    [M.Volume(id='fake-volume', lifecycle_state='AVAILABLE', size_in_gbs=size)]}), 0 if allowed else 1)
+                self.assertEqual(bool(f.creates), allowed)
+
+    def test_18_recheck_after_arm_rejection(self):
+        count = [0]
+        def volumes(query, kw):
+            count[0] += 1
+            return [] if count[0] <= 2 else [M.Volume(lifecycle_state='AVAILABLE', size_in_gbs=200)]
+        f, _ = self.stopped(FakeIO(launches=[capacity()], overrides={('list_volumes', TENANCY, None): volumes}))
+        self.assertEqual(len(f.creates), 1)
+
+    def test_19_invalid_image_architecture(self):
+        for bad in [image(AMD), image(ARM, operating_system_version='22.04'), image(ARM, size_in_mbs=60000),
+                    image(ARM, compartment_id=TARGET)]:
+            with self.subTest(image=bad.display_name):
+                f, _ = self.stopped(FakeIO(overrides={'list_images': [bad]}))
+                self.assertFalse(f.creates)
+
+    def test_20_image_override(self):
+        f, status, _ = self.run_case(IMAGE_ID_ARM=image().id)
+        self.assertEqual(status, 0)
+        self.assertIn('get_image_shape_compatibility_entry', f.events)
+        self.assertEqual(len(f.creates), 1)
+
+    def test_21_notification_failure_still_disables(self):
+        f, _ = self.stopped(FakeIO(notify_ok=False))
+        self.assertEqual(len(f.creates), 1)
+
+    def test_22_disable_failure_alerts(self):
+        for code in (200, 403):
+            with self.subTest(status=code):
+                f, output = self.stopped(FakeIO(disable_status=code))
+                self.assertEqual(len(f.notifications), 2)
+                self.assertIn('manually disable', output)
+
+    def test_23_diagnostic_locks(self):
+        for lock, mode in [('true', 'false'), ('', 'false'), ('FALSE', 'false'), (None, 'false'), ('false', 'true')]:
+            with self.subTest(lock=lock, mode=mode):
+                f, status, _ = self.run_case(HUNT_DIAGNOSTIC_LOCK=lock, HUNT_DIAGNOSTIC_ONLY=mode)
+                self.assertEqual(status, 0)
+                self.assertFalse(f.creates or f.notifications or f.disables)
+
+    def test_24_ambiguous_500_is_not_capacity(self):
+        f, _ = self.stopped(FakeIO(launches=[error(500, 'InternalError', 'temporary unavailable')]))
+        self.assertEqual(len(f.creates), 1)
+
+    def test_25_unknown_state(self):
+        f, _ = self.stopped(FakeIO(targets=[[instance(state='UNKNOWN_ENUM_VALUE')]]))
+        self.assertFalse(f.creates)
+
+    def test_26_home_and_subnet(self):
+        for overrides in [
+            {'list_region_subscriptions': [oci.identity.models.RegionSubscription(region_name='other', is_home_region=True)]},
+            {'get_subnet': M.Subnet(id='ocid1.subnet.oc1.ap-kulai-2.fake', lifecycle_state='AVAILABLE', prohibit_public_ip_on_vnic=True)}]:
+            with self.subTest(case=list(overrides)[0]):
+                f, _ = self.stopped(FakeIO(overrides=overrides))
+                self.assertFalse(f.creates)
+
+    def test_27_sdk_header_retry_disabled(self):
+        # Exercise the real SDK request layer too: NoneRetryStrategy alone does not disable this loop.
+        from urllib3.exceptions import HeaderParsingError
+        config = dict(region=REGION, tenancy=TENANCY, user='ocid1.user.oc1..fake',
+                      fingerprint=':'.join(['aa'] * 16), key_content=MARKER)
+        production, status, _ = self.run_case()
+        self.assertEqual(status, 0)
+        client = oci.core.ComputeClient(config, signer=oci.signer.AbstractBaseSigner(),
+                                       retry_strategy=oci.retry.NoneRetryStrategy())
+        old = logging.root.manager.disable
+        try:
+            logging.disable(logging.CRITICAL)
+            with patch.dict(os.environ, {'OCI_HEADER_PARSING_ERROR_MAX_RETRIES': '0'}), \
+                 patch.object(client.base_client.session, 'request', side_effect=HeaderParsingError([], MARKER)) as request, \
+                 patch.object(socket.socket, 'connect', side_effect=AssertionError('No network')):
+                with self.assertRaises(oci.exceptions.RequestException):
+                    client.launch_instance(production.creates[0], retry_strategy=oci.retry.NoneRetryStrategy())
+                self.assertEqual(request.call_count, 1)
+                wire = json.loads(request.call_args.kwargs['data'])
+                self.assertEqual(wire['sourceDetails']['bootVolumeSizeInGBs'], 50)
+                self.assertEqual(wire['sourceDetails']['bootVolumeVpusPerGB'], 10)
+                self.assertEqual(wire['shapeConfig'], {'ocpus': 2, 'memoryInGBs': 12})
+                self.assertTrue(wire['createVnicDetails']['assignPublicIp'])
+        finally:
+            logging.disable(old)
+
+    def test_28_ordinary_query_429_is_silent_round_stop(self):
+        for op in ['list_instances', 'list_region_subscriptions', 'list_availability_domains',
+                   'get_subnet', 'list_compartments', 'list_volumes', 'list_boot_volumes', 'list_images']:
+            with self.subTest(op=op):
+                f, status, output = self.run_case(FakeIO(overrides={op: error(429)}))
+                self.assertEqual(status, 0)
+                self.assertEqual(output, '')
+                self.assertFalse(f.creates or f.notifications or f.disables)
+
+    def test_29_real_private_key_loading_is_classified(self):
+        # The signer must not be mocked here: exercise the real SDK key-loading path.
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        plain = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                  serialization.NoEncryption()).decode()
+        locked = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                   serialization.BestAvailableEncryption(b'test passphrase')).decode()
+        public = key.public_key().public_bytes(serialization.Encoding.PEM,
+                                               serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+        cases = [('private_key_passphrase', locked),
+                 ('private_key_is_public', public),
+                 ('private_key_invalid', '-----BEGIN PRIVATE KEY-----\\n' + 'A' * 40 + '\\n-----END PRIVATE KEY-----\\n'),
+                 # Two characters and one character produce plural/singular SDK wording; both must classify.
+                 ('private_key_non_ascii', plain.replace('BEGIN', '中文 BEGIN', 1)),
+                 ('private_key_non_ascii', plain.replace('BEGIN', '中 BEGIN', 1))]
+        for category, content in cases:
+            with self.subTest(category=category):
+                f, status, output = self.run_case(OCI_CLI_KEY_CONTENT=content, unmock_signer=True)
                 self.assertEqual(status, 1)
-                self.assertIn('stage=block_volumes category=stdout_empty http=none '
-                              'stderr_kind=' + expected_kind, output)
-                self.assertNotIn(SENSITIVE, output)
-                self.assertNotIn('/mock/', output)
-                self.assert_counts(mock, 0, 0, 0)
-                self.assertNotIn('launch', mock.events)
+                self.assertIn('category=' + category, output)
+                self.assertIn('stage=credentials', output)
+                self.assertFalse(f.creates)
+                self.assertEqual(len(f.notifications), 1)  # fail-closed: alert once, disable once
+                self.assertEqual(len(f.disables), 1)
+                self.assertNotIn('BEGIN', output)
+                self.assertNotIn('test passphrase', output)
+                self.assertIn('category=' + category, f.notifications[0])
+                self.assertNotIn(content, f.notifications[0])
+            with self.subTest(category=category, locked=True):
+                # Under the diagnostic lock the same defect stays read-only: no launch, notify or disable.
+                f, status, output = self.run_case(OCI_CLI_KEY_CONTENT=content, unmock_signer=True,
+                                                  HUNT_DIAGNOSTIC_LOCK='true')
+                self.assertEqual(status, 1)
+                self.assertIn('category=' + category, output)
+                self.assertFalse(f.creates or f.notifications or f.disables)
+        # A genuine unencrypted key must load and let the run proceed to the read-only stop.
+        f, status, output = self.run_case(OCI_CLI_KEY_CONTENT=plain, unmock_signer=True,
+                                          HUNT_DIAGNOSTIC_LOCK='true')
+        self.assertEqual(status, 0)
+        self.assertIn('checks_passed', output)
 
-        namespace = {}
-        prefix = SOURCE.split("\ntry:\n    need(env.get('HUNT_DIAGNOSTIC_ONLY'", 1)[0]
-        with patch.dict(os.environ, {'HUNT_DIAGNOSTIC_LOCK': 'true'}, clear=True):
-            exec(compile(prefix, str(WORKFLOW), 'exec'), namespace)
-            self.assertEqual(namespace['classify_stderr'](' \n'), 'empty')
-            self.assertEqual(namespace['classify_stderr'](None), 'empty')
-            self.assertEqual(namespace['classify_stderr'](SENSITIVE), 'unknown')
+    def test_30_credential_field_shape_is_classified(self):
+        # Client construction validates fingerprint/user/tenancy shape; each field gets its own label.
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        plain = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                  serialization.NoEncryption()).decode()
+        good_fp = ':'.join(['ab'] * 16)
+        cases = {'credential_field_fingerprint': {'OCI_CLI_FINGERPRINT': 'aa:bb:cc'},
+                 'credential_field_user': {'OCI_CLI_USER': 'not-an-ocid@example.com'},
+                 'credential_field_tenancy': {'OCI_CLI_TENANCY': 'my-tenancy'}}
+        for category, override in cases.items():
+            with self.subTest(category=category):
+                f, status, output = self.run_case(OCI_CLI_KEY_CONTENT=plain, unmock_signer=True,
+                                                  HUNT_DIAGNOSTIC_LOCK='true', **override)
+                self.assertEqual(status, 1)
+                self.assertIn('category=' + category, output)
+                self.assertIn('stage=credentials', output)
+                self.assertFalse(f.creates or f.notifications or f.disables)
+                self.assertNotIn(override[list(override)[0]], output)
+        # A well-formed credential set must still reach the read-only stop.
+        f, status, output = self.run_case(OCI_CLI_KEY_CONTENT=plain, unmock_signer=True,
+                                          HUNT_DIAGNOSTIC_LOCK='true', OCI_CLI_FINGERPRINT=good_fp)
+        self.assertEqual(status, 0)
+        self.assertIn('checks_passed', output)
+        # Outside the lock the same defect stays fail-closed: one alert, one disable, no creation.
+        f, status, output = self.run_case(OCI_CLI_KEY_CONTENT=plain, unmock_signer=True,
+                                          OCI_CLI_FINGERPRINT='aa:bb:cc')
+        self.assertEqual(status, 1)
+        self.assertIn('category=credential_field_fingerprint', output)
+        self.assertEqual(len(f.notifications), 1)
+        self.assertEqual(len(f.disables), 1)
+        self.assertFalse(f.creates)
+        self.assertNotIn('aa:bb:cc', f.notifications[0])
+        self.assertIn('credential_field_fingerprint', f.notifications[0])
 
 
 if __name__ == '__main__':
+    assert oci.__version__ == '2.187.2', 'Use the pinned SDK for contract verification'
     unittest.main(verbosity=2)
