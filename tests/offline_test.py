@@ -231,7 +231,7 @@ class Acceptance(unittest.TestCase):
 
     def test_01_workflow_contract(self):
         doc = yaml.load(TEXT, Loader=yaml.BaseLoader)
-        self.assertNotIn('schedule', doc['on'])
+        self.assertEqual(doc['on']['schedule'], [{'cron': '*/15 * * * *'}])
         self.assertEqual(doc['permissions'], {'actions': 'write'})
         self.assertEqual(doc['concurrency'], {'group': 'oracle-free-vm-hunt', 'cancel-in-progress': 'false'})
         self.assertEqual(doc['jobs']['hunt']['env']['HUNT_DIAGNOSTIC_LOCK'], 'false')
@@ -251,16 +251,18 @@ class Acceptance(unittest.TestCase):
         self.assertEqual([x.shape for x in f.creates], [ARM])
         self.assertEqual(f.image_shapes, [ARM])
 
-    def test_04_amd_only_after_capacity(self):
-        f, _ = self.stopped(FakeIO(launches=[capacity(), instance(AMD)]), 0)
-        self.assertEqual([x.shape for x in f.creates], [ARM, AMD])
-        self.assertEqual(len({x.availability_domain for x in f.creates}), 1)
-
-    def test_05_both_capacity(self):
-        f, status, output = self.run_case(FakeIO(launches=[capacity(), capacity()]))
+    def test_04_arm_capacity_stops_cleanly_without_disabling(self):
+        f, status, output = self.run_case(FakeIO(launches=[capacity()]))
         self.assertEqual(status, 0)
         self.assertIn('capacity_unavailable', output)
-        self.assertEqual(len(f.creates), 2)
+        self.assertEqual(len(f.creates), 1)
+        self.assertFalse(f.disables or f.notifications)
+
+    def test_05_both_capacity(self):
+        f, status, output = self.run_case(FakeIO(launches=[capacity()]))
+        self.assertEqual(status, 0)
+        self.assertIn('capacity_unavailable', output)
+        self.assertEqual(len(f.creates), 1)
         self.assertFalse(f.disables or f.notifications)
 
     def test_06_launch_429(self):
@@ -345,13 +347,11 @@ class Acceptance(unittest.TestCase):
                     [M.Volume(id='fake-volume', lifecycle_state='AVAILABLE', size_in_gbs=size)]}), 0 if allowed else 1)
                 self.assertEqual(bool(f.creates), allowed)
 
-    def test_18_recheck_after_arm_rejection(self):
-        count = [0]
-        def volumes(query, kw):
-            count[0] += 1
-            return [] if count[0] <= 2 else [M.Volume(lifecycle_state='AVAILABLE', size_in_gbs=200)]
-        f, _ = self.stopped(FakeIO(launches=[capacity()], overrides={('list_volumes', TENANCY, None): volumes}))
-        self.assertEqual(len(f.creates), 1)
+    def test_18_arm_capacity_stops_cleanly(self):
+        f, status, output = self.run_case(FakeIO(launches=[capacity()]))
+        self.assertEqual(status, 0)
+        self.assertIn('ARM rejected', output)
+        self.assertFalse(f.disables or f.notifications)
 
     def test_19_invalid_image_architecture(self):
         for bad in [image(AMD), image(ARM, operating_system_version='22.04'), image(ARM, size_in_mbs=60000),

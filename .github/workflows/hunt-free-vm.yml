@@ -1,6 +1,8 @@
 name: Hunt OCI Always Free VM SDK
 
 on:
+  schedule:
+    - cron: '*/15 * * * *'
   # schedule is added only after separately authorized real acceptance.
   workflow_dispatch:
     inputs:
@@ -334,46 +336,43 @@ jobs:
 
           def hunt(ad):
               global stage
-              for shape in (ARM, AMD):
-                  # Resolve AMD only after an unambiguous ARM capacity rejection.
-                  image_id = image_for(shape)
-                  need(ad == preflight(), 'AD configuration changed during this run. Confirm manually.')
-                  check_target()
-                  need(time.monotonic() - started < 900, 'Run budget exhausted before creation. Check manually.')
-                  need(not diagnostic_only, 'Diagnostic mode forbids creation.')
-                  details = sdk.core.models.LaunchInstanceDetails(
-                      compartment_id=env['OCI_COMPARTMENT_ID'], availability_domain=ad,
-                      shape=shape, display_name='always-free-sdk', capacity_reservation_id='',
-                      create_vnic_details=sdk.core.models.CreateVnicDetails(
-                          subnet_id=env['OCI_SUBNET_ID'], assign_public_ip=True),
-                      source_details=sdk.core.models.InstanceSourceViaImageDetails(
-                          image_id=image_id, boot_volume_size_in_gbs=50, boot_volume_vpus_per_gb=10),
-                      metadata={'ssh_authorized_keys': env['SSH_PUBLIC_KEY'].strip()},
-                      shape_config=(sdk.core.models.LaunchInstanceShapeConfigDetails(ocpus=2, memory_in_gbs=12)
-                                    if shape == ARM else None))
-                  stage = 'launch_arm' if shape == ARM else 'launch_amd'
-                  try:
-                      response = query(stage, compute.launch_instance, launch_instance_details=details,
-                                       opc_retry_token=str(uuid.uuid4()))
-                      result = sdk.util.to_dict(response.data)
-                  except OciError as error:
-                      if error.status == 429:
-                          print('Round stopped: stage=' + stage + ' category=rate_limit http=429')
-                          return
-                      if error.status == 500 and error.code == 'InternalError' and isinstance(error.message, str) \
-                              and error.message.strip().lower().rstrip('.') == 'out of host capacity':
-                          continue
-                      if error.status in (400, 401, 403, 404, 409, 422) or error.code == 'LimitExceeded':
-                          finish('OCI rejected creation. Check IAM, quota and configuration before re-enabling.',
-                                 detail=diagnostic_detail(error))
-                      reconcile()
-                  else:
-                      if isinstance(result, dict) and result.get('id') \
-                              and result.get('shape') == shape and result.get('lifecycle_state') in VALID:
-                          finish('Created ' + ('ARM 2 OCPU / 12 GB' if shape == ARM else 'AMD Micro fallback')
-                                 + ' with a 50 GB boot disk; no further creation.', success=True)
-                      reconcile()
-              print('Round complete: category=capacity_unavailable; ARM and AMD rejected; no instance accepted.')
+              shape = ARM
+              image_id = image_for(shape)
+              need(ad == preflight(), 'AD configuration changed during this run. Confirm manually.')
+              check_target()
+              need(time.monotonic() - started < 900, 'Run budget exhausted before creation. Check manually.')
+              need(not diagnostic_only, 'Diagnostic mode forbids creation.')
+              details = sdk.core.models.LaunchInstanceDetails(
+                  compartment_id=env['OCI_COMPARTMENT_ID'], availability_domain=ad,
+                  shape=shape, display_name='always-free-sdk', capacity_reservation_id='',
+                  create_vnic_details=sdk.core.models.CreateVnicDetails(
+                      subnet_id=env['OCI_SUBNET_ID'], assign_public_ip=True),
+                  source_details=sdk.core.models.InstanceSourceViaImageDetails(
+                      image_id=image_id, boot_volume_size_in_gbs=50, boot_volume_vpus_per_gb=10),
+                  metadata={'ssh_authorized_keys': env['SSH_PUBLIC_KEY'].strip()},
+                  shape_config=sdk.core.models.LaunchInstanceShapeConfigDetails(ocpus=2, memory_in_gbs=12))
+              stage = 'launch_arm'
+              try:
+                  response = query(stage, compute.launch_instance, launch_instance_details=details,
+                                   opc_retry_token=str(uuid.uuid4()))
+                  result = sdk.util.to_dict(response.data)
+              except OciError as error:
+                  if error.status == 429:
+                      print('Round stopped: stage=' + stage + ' category=rate_limit http=429')
+                      return
+                  if (error.status == 500 and error.code == 'InternalError' and isinstance(error.message, str)
+                          and error.message.strip().lower().rstrip('.') == 'out of host capacity'):
+                      print('Round complete: category=capacity_unavailable; ARM rejected; no instance accepted.')
+                      return
+                  if error.status in (400, 401, 403, 404, 409, 422) or error.code == 'LimitExceeded':
+                      finish('OCI rejected creation. Check IAM, quota and configuration before re-enabling.',
+                             detail=diagnostic_detail(error))
+                  reconcile()
+              else:
+                  if (isinstance(result, dict) and result.get('id')
+                          and result.get('shape') == shape and result.get('lifecycle_state') in VALID):
+                      finish('Created ARM 2 OCPU / 12 GB with a 50 GB boot disk; no further creation.', success=True)
+                  reconcile()
 
           try:
               need(env.get('HUNT_DIAGNOSTIC_ONLY', 'false') in ('true', 'false'), 'Invalid execution mode.')
@@ -455,7 +454,6 @@ jobs:
               ad = preflight()
               if diagnostic_only:
                   image_for(ARM)
-                  image_for(AMD)
                   print('Diagnostic-only complete: category=checks_passed; no launch, notification or disable.')
                   raise SystemExit(0)
               hunt(ad)
