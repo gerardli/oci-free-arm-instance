@@ -1,8 +1,7 @@
-name: Hunt OCI Always Free VM v3.1
+name: Hunt OCI Always Free VM SDK
 
 on:
-  schedule:
-    - cron: '*/15 * * * *'
+  # schedule is added only after separately authorized real acceptance.
   workflow_dispatch:
     inputs:
       diagnostic_only:
@@ -25,7 +24,6 @@ jobs:
       # Temporary diagnostic lock: all events are read-only until explicitly released.
       HUNT_DIAGNOSTIC_LOCK: 'true'
       HUNT_DIAGNOSTIC_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnostic_only == true && 'true' || 'false' }}
-      OCI_CLI_REGION: ap-kulai-2
       OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
       OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
       OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
@@ -48,25 +46,18 @@ jobs:
           umask 077
           python3 - <<'PY'
           import json
+          import logging
           import os
           import re
           import subprocess
           import sys
-          import tempfile
           import time
-          from pathlib import Path
+          import uuid
 
           REGION = 'ap-kulai-2'
           ARM = 'VM.Standard.A1.Flex'
           AMD = 'VM.Standard.E2.1.Micro'
           VALID = {'PROVISIONING', 'RUNNING', 'STARTING', 'STOPPING', 'STOPPED', 'MOVING'}
-          # Only these fully paginated list commands can legitimately render an empty collection as blank stdout.
-          LIST_COMMANDS = {('iam', 'region-subscription', 'list'), ('iam', 'availability-domain', 'list'),
-                           ('iam', 'compartment', 'list'), ('compute', 'instance', 'list'),
-                           ('compute', 'image', 'list'), ('bv', 'volume', 'list'), ('bv', 'boot-volume', 'list')}
-          CLI_QUERY_EMPTY_RESULT_WARNING = 'Query returned empty result, no output to show.'
-          CLI_PAGINATION_WARNING = ('WARNING: This operation supports pagination and not all resources were returned. '
-                                    'Re-run using the --all option to auto paginate and list all resources.')
           started = time.monotonic()
           env = os.environ
           diagnostic_only = env.get('HUNT_DIAGNOSTIC_LOCK', 'true') != 'false' or env.get('HUNT_DIAGNOSTIC_ONLY', 'false') == 'true'
@@ -76,31 +67,10 @@ jobs:
               pass
 
           class OciError(Exception):
-              def __init__(self, status=None, code='', message='', category='cli_error', stderr_kind=None):
+              def __init__(self, status=None, code='', message='', category='sdk_error'):
                   self.status = status if type(status) is int and 100 <= status <= 599 else None
                   self.code, self.message, self.category = code, message, category
-                  self.stderr_kind = stderr_kind
-
-          def classify_stderr(stderr):
-              # Return fixed labels only. stderr can contain paths, identities, or other sensitive data.
-              if not isinstance(stderr, str) or not stderr.strip():
-                  return 'empty'
-              output = stderr.strip()
-              if output == CLI_QUERY_EMPTY_RESULT_WARNING:
-                  return 'query_empty_result_warning'
-              if output == CLI_PAGINATION_WARNING:
-                  return 'pagination_warning'
-              lines = [line.strip() for line in output.splitlines() if line.strip()]
-              if (len(lines) == 5
-                      and re.fullmatch(r'WARNING: Permissions on .+ are too open\.', lines[0])
-                      and lines[1] == 'To fix this please try executing the following command:'
-                      and lines[2].startswith('oci setup repair-file-permissions --file ')
-                      and lines[3] == ('Alternatively to hide this warning, you may set the environment variable, '
-                                       'OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING:')
-                      and lines[4] == 'export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True'):
-                  return 'file_permissions_warning'
-              return 'unknown'
-
+              
           def diagnostic_detail(error=None, category='validation_error'):
               # Only fixed labels and validated numeric HTTP status may leave this process.
               status = error.status if isinstance(error, OciError) else None
@@ -109,34 +79,12 @@ jobs:
                       status, 'service_error' if status is not None else error.category)
                   if error.code == 'LimitExceeded':
                       category = 'quota'
-              allowed = {'validation_error', 'cli_error', 'timeout', 'transport', 'invalid_response',
-                         'stdout_empty', 'authentication', 'authorization', 'rate_limit', 'service_error',
+              allowed = {'validation_error', 'sdk_error', 'timeout', 'transport', 'invalid_response',
+                         'authentication', 'authorization', 'rate_limit', 'service_error',
                          'quota', 'runner_error', 'unknown_result'}
-              category = category if category in allowed else 'cli_error'
+              category = category if category in allowed else 'sdk_error'
               detail = 'stage=' + stage + ' category=' + category + ' http=' + (str(status) if status else 'none')
-              if isinstance(error, OciError) and error.category == 'stdout_empty':
-                  allowed_stderr = {'empty', 'query_empty_result_warning', 'pagination_warning',
-                                    'file_permissions_warning', 'unknown'}
-                  stderr_kind = error.stderr_kind if error.stderr_kind in allowed_stderr else 'unknown'
-                  detail += ' stderr_kind=' + stderr_kind
               return detail
-
-          def operation_stage(args):
-              operation = tuple(args[:3])
-              labels = {('iam', 'region-subscription', 'list'): 'region_subscription',
-                        ('iam', 'availability-domain', 'list'): 'availability_domains',
-                        ('network', 'subnet', 'get'): 'subnet',
-                        ('iam', 'compartment', 'list'): 'compartments',
-                        ('bv', 'volume', 'list'): 'block_volumes',
-                        ('bv', 'boot-volume', 'list'): 'boot_volumes'}
-              if operation == ('compute', 'instance', 'list'):
-                  return 'target_instances' if args[args.index('--compartment-id') + 1] == env['OCI_COMPARTMENT_ID'] else 'other_instances'
-              if operation == ('compute', 'instance', 'launch'):
-                  return 'launch_arm' if args[args.index('--shape') + 1] == ARM else 'launch_amd'
-              if operation in (('compute', 'image', 'list'), ('compute', 'image', 'get'),
-                               ('compute', 'image-shape-compatibility-entry', 'get')):
-                  return stage  # image_for sets a fixed architecture label before these calls.
-              return labels.get(operation, 'oci_query')
 
           def need(condition, reason):
               if not condition:
@@ -164,7 +112,7 @@ jobs:
                   status, body = http(
                       'https://api.telegram.org/bot' + env['TG_BOT_TOKEN'] + '/sendMessage', 'POST',
                       ['Content-Type: application/json'],
-                      {'chat_id': env['TG_CHAT_ID'], 'text': 'OCI hunt v3.1: ' + message})
+                      {'chat_id': env['TG_CHAT_ID'], 'text': 'OCI hunt SDK: ' + message})
                   try:
                       if status == 200 and json.loads(body).get('ok') is True:
                           return True
@@ -175,8 +123,8 @@ jobs:
 
           def finish(message, success=False, detail=None):
               if diagnostic_only:
-                  print('Diagnostic-only stopped: ' + (detail or diagnostic_detail()))
-                  raise SystemExit(1)
+                  print('Diagnostic-only stopped: ' + ('category=existing_target' if success else (detail or diagnostic_detail())))
+                  raise SystemExit(0 if success else 1)
               if not success:
                   detail = detail or diagnostic_detail()
                   print('OCI failure: ' + detail)
@@ -199,63 +147,56 @@ jobs:
               print('Workflow disabled.' if disabled else 'ERROR: manually disable workflow in GitHub Actions.')
               raise SystemExit(0 if success and disabled and notified else 1)
 
-          def oci(*args, launch=False):
+          def query(label, method, **kwargs):
               global stage
-              stage = operation_stage(args)
-              need(not diagnostic_only or not launch, 'Diagnostic mode forbids creation.')
+              stage = label
               try:
-                  result = subprocess.run(
-                      ['oci', '--region', REGION, '--no-retry', '--connection-timeout', '10',
-                       '--read-timeout', '30', '--output', 'json', *args],
-                      text=True, capture_output=True, timeout=90 if launch else 60)
-              except subprocess.TimeoutExpired:
-                  raise OciError(category='timeout') from None
-              except OSError:
+                  return method(retry_strategy=no_retry, **kwargs)
+              except sdk.exceptions.ServiceError as error:
+                  raise OciError(error.status, error.code, error.message) from None
+              except sdk.exceptions.RequestException:
                   raise OciError(category='transport') from None
-              if result.returncode:
-                  # OCI ServiceError is JSON prefixed by a label. Never relay raw output.
-                  raw = result.stderr + '\n' + result.stdout
-                  try:
-                      error, _ = json.JSONDecoder().raw_decode(raw[raw.index('{'):])
-                      raise OciError(error.get('status'), error.get('code', ''), error.get('message', ''))
-                  except (ValueError, AttributeError):
-                      raise OciError(category='cli_error') from None
-              # oci-cli 3.94.2 render() adds data only when truthy, then prints only a non-empty
-              # display dictionary. A known list --all with exit 0 and blank stdout/stderr is [].
-              # get/launch, stderr, header-only JSON and every other body stay rejected.
-              if not result.stdout.strip():
-                  if (tuple(args[:3]) in LIST_COMMANDS and '--all' in args and not result.stderr.strip()):
-                      return []
-                  raise OciError(category='stdout_empty', stderr_kind=classify_stderr(result.stderr))
-              try:
-                  parsed = json.loads(result.stdout)
-              except ValueError:
+              except Exception:
                   raise OciError(category='invalid_response') from None
-              if not isinstance(parsed, dict) or 'data' not in parsed:
-                  raise OciError(category='invalid_response')
-              return parsed['data']
 
-          def listing(*args):
-              rows = oci(*args, '--all')
-              need(isinstance(rows, list) and all(isinstance(x, dict) for x in rows),
-                   'Inventory response is invalid. Confirm configuration manually.')
-              return rows
+          def listing(label, method, **kwargs):
+              # Use structured SDK collections; follow every next-page token, fail closed.
+              rows, seen = [], set()
+              while True:
+                  response = query(label, method, **kwargs)
+                  data = sdk.util.to_dict(response.data)
+                  need(isinstance(data, list) and all(isinstance(x, dict) for x in data),
+                       'Inventory response is invalid. Confirm configuration manually.')
+                  rows.extend(data)
+                  page = response.headers.get('opc-next-page')
+                  if page is None:
+                      return rows
+                  need(isinstance(page, str) and bool(page) and page not in seen,
+                       'Invalid or repeated pagination token. Confirm inventory manually.')
+                  seen.add(page)
+                  kwargs['page'] = page
+
+          def get(label, method, **kwargs):
+              data = sdk.util.to_dict(query(label, method, **kwargs).data)
+              need(isinstance(data, dict), 'Invalid structured OCI response.')
+              return data
 
           def inventory(compartment):
-              rows = listing('compute', 'instance', 'list', '--compartment-id', compartment)
-              need(all(isinstance(x.get('shape'), str) and isinstance(x.get('lifecycle-state'), str)
+              rows = listing('target_instances' if compartment == env['OCI_COMPARTMENT_ID'] else 'other_instances',
+                             compute.list_instances, compartment_id=compartment)
+              need(all(isinstance(x.get('shape'), str) and isinstance(x.get('lifecycle_state'), str)
                        and x.get('id') for x in rows), 'Instance inventory is incomplete.')
               targets = [x for x in rows if x['shape'] in (ARM, AMD)]
-              need(all(x['lifecycle-state'] in VALID | {'TERMINATING', 'TERMINATED'} for x in targets),
+              need(all(x['lifecycle_state'] in VALID | {'TERMINATING', 'TERMINATED'} for x in targets),
                    'Unknown instance state. Confirm inventory manually.')
               return targets
 
           def existing_target(targets):
-              return next((x for x in targets if x['lifecycle-state'] != 'TERMINATED'), None)
+              return next((x for x in targets if x['lifecycle_state'] != 'TERMINATED'), None)
 
           def target_message(target):
               # inventory() validates shape/state against fixed allowlists before notification.
-              return ('Existing ' + target['shape'] + ' instance in ' + target['lifecycle-state']
+              return ('Existing ' + target['shape'] + ' instance in ' + target['lifecycle_state']
                       + '; hunt target achieved; no additional instance created.')
 
           def check_target():
@@ -264,15 +205,15 @@ jobs:
                   finish(target_message(target), success=True)
 
           def validate_image(image, shape):
-              name = image.get('display-name', '')
-              need(image.get('compartment-id') is None
-                   and image.get('operating-system') == 'Canonical Ubuntu'
-                   and image.get('operating-system-version') in ('24.04', '24.04 Minimal')
-                   and image.get('lifecycle-state') == 'AVAILABLE'
+              name = image.get('display_name', '')
+              need(image.get('compartment_id') is None
+                   and image.get('operating_system') == 'Canonical Ubuntu'
+                   and image.get('operating_system_version') in ('24.04', '24.04 Minimal')
+                   and image.get('lifecycle_state') == 'AVAILABLE'
                    and re.fullmatch(r'Canonical-Ubuntu-24\.04(?:-Minimal)?(?:-aarch64)?-\d{4}\.\d{2}\.\d{2}-\d+', name)
                    and ('-aarch64-' in name) == (shape == ARM)
-                   and isinstance(image.get('size-in-mbs'), int)
-                   and 0 < image['size-in-mbs'] <= 50 * 1024
+                   and isinstance(image.get('size_in_mbs'), int)
+                   and 0 < image['size_in_mbs'] <= 50 * 1024
                    and isinstance(image.get('id'), str)
                    and image['id'].startswith('ocid1.image.oc1.' + REGION + '.'),
                    'Cannot confirm a free Ubuntu 24.04 platform image within a 50 GB boot disk. Confirm manually.')
@@ -283,19 +224,19 @@ jobs:
               stage = 'image_arm' if shape == ARM else 'image_amd'
               override = env.get('IMAGE_ID_ARM' if shape == ARM else 'IMAGE_ID_AMD')
               if override:
-                  image = oci('compute', 'image', 'get', '--image-id', override)
+                  image = get(stage, compute.get_image, image_id=override)
                   need(isinstance(image, dict), 'Invalid image response.')
                   image_id = validate_image(image, shape)
                   need(image_id == override, 'Image override response does not match.')
                   stage = 'image_compat_arm' if shape == ARM else 'image_compat_amd'
-                  entry = oci('compute', 'image-shape-compatibility-entry', 'get',
-                              '--image-id', image_id, '--shape-name', shape)
-                  need(isinstance(entry, dict) and entry.get('image-id') == image_id
+                  entry = get(stage, compute.get_image_shape_compatibility_entry,
+                              image_id=image_id, shape_name=shape)
+                  need(isinstance(entry, dict) and entry.get('image_id') == image_id
                        and entry.get('shape') == shape, 'Image override is not shape-compatible.')
                   return image_id
-              images = listing('compute', 'image', 'list', '--compartment-id', env['OCI_COMPARTMENT_ID'],
-                               '--operating-system', 'Canonical Ubuntu', '--shape', shape,
-                               '--sort-by', 'TIMECREATED', '--sort-order', 'DESC')
+              images = listing(stage, compute.list_images, compartment_id=env['OCI_COMPARTMENT_ID'],
+                               operating_system='Canonical Ubuntu', shape=shape,
+                               sort_by='TIMECREATED', sort_order='DESC')
               for image in images:
                   try:
                       return validate_image(image, shape)
@@ -304,46 +245,47 @@ jobs:
               raise Halt('No verified free Ubuntu 24.04 image for this shape. Confirm manually.')
 
           def preflight():
-              subscriptions = listing('iam', 'region-subscription', 'list', '--tenancy-id', env['OCI_CLI_TENANCY'])
-              homes = [x.get('region-name') for x in subscriptions if x.get('is-home-region') is True]
+              subscriptions = listing('region_subscription', identity.list_region_subscriptions, tenancy_id=env['OCI_CLI_TENANCY'])
+              homes = [x.get('region_name') for x in subscriptions if x.get('is_home_region') is True]
               need(homes == [REGION], 'ap-kulai-2 must be the tenancy home region. Confirm free eligibility manually.')
-              domains = listing('iam', 'availability-domain', 'list', '--compartment-id', env['OCI_CLI_TENANCY'])
+              domains = listing('availability_domains', identity.list_availability_domains, compartment_id=env['OCI_CLI_TENANCY'])
               ads = [x.get('name') for x in domains]
               need(ads and all(isinstance(ad, str) and 'AP-KULAI-2-AD-' in ad for ad in ads),
                    'Availability domains could not be verified.')
-              subnet = oci('network', 'subnet', 'get', '--subnet-id', env['OCI_SUBNET_ID'])
+              subnet = get('subnet', network.get_subnet, subnet_id=env['OCI_SUBNET_ID'])
               need(isinstance(subnet, dict) and subnet.get('id') == env['OCI_SUBNET_ID']
-                   and subnet.get('lifecycle-state') == 'AVAILABLE', 'Subnet could not be verified.')
-              need(subnet.get('prohibit-public-ip-on-vnic') is False,
+                   and subnet.get('lifecycle_state') == 'AVAILABLE', 'Subnet could not be verified.')
+              need(subnet.get('prohibit_public_ip_on_vnic') is False,
                    'Subnet does not explicitly allow public IP assignment. Check subnet configuration manually.')
-              subnet_ad = subnet.get('availability-domain')
+              subnet_ad = subnet.get('availability_domain')
               chosen = env.get('AD_NAME') or subnet_ad
               need(not chosen or chosen in ads, 'AD_NAME or subnet AD is outside ap-kulai-2.')
               need(not subnet_ad or not chosen or subnet_ad == chosen, 'Subnet and AD_NAME disagree.')
-              compartments = listing('iam', 'compartment', 'list', '--compartment-id', env['OCI_CLI_TENANCY'],
-                                     '--compartment-id-in-subtree', 'true', '--access-level', 'ANY', '--include-root')
-              need(all(x.get('id') and x.get('lifecycle-state') in ('ACTIVE', 'DELETED') for x in compartments),
+              compartments = listing('compartments', identity.list_compartments,
+                                     compartment_id=env['OCI_CLI_TENANCY'],
+                                     compartment_id_in_subtree=True, access_level='ANY')
+              need(all(x.get('id') and x.get('lifecycle_state') in ('ACTIVE', 'DELETED') for x in compartments),
                    'Cannot verify tenancy compartment inventory.')
-              ids = {env['OCI_CLI_TENANCY']} | {x['id'] for x in compartments if x['lifecycle-state'] == 'ACTIVE'}
+              ids = {env['OCI_CLI_TENANCY']} | {x['id'] for x in compartments if x['lifecycle_state'] == 'ACTIVE'}
               need(env['OCI_COMPARTMENT_ID'] in ids, 'Target compartment is not active in this tenancy.')
               storage = 0
               for compartment in sorted(ids):
                   if compartment != env['OCI_COMPARTMENT_ID']:
-                      need(all(x['lifecycle-state'] == 'TERMINATED' for x in inventory(compartment)),
+                      need(all(x['lifecycle_state'] == 'TERMINATED' for x in inventory(compartment)),
                            'A1/E2 exists in another compartment. Confirm tenancy free quota manually.')
-                  volumes = listing('bv', 'volume', 'list', '--compartment-id', compartment)
+                  volumes = listing('block_volumes', storage_client.list_volumes, compartment_id=compartment)
                   for ad in ads:
-                      volumes += listing('bv', 'boot-volume', 'list', '--compartment-id', compartment,
-                                         '--availability-domain', ad)
+                      volumes += listing('boot_volumes', storage_client.list_boot_volumes, compartment_id=compartment,
+                                         availability_domain=ad)
                   for volume in volumes:
-                      if volume.get('lifecycle-state') == 'TERMINATED':
+                      if volume.get('lifecycle_state') == 'TERMINATED':
                           continue
-                      need(volume.get('lifecycle-state') in ('AVAILABLE', 'PROVISIONING', 'RESTORING', 'TERMINATING', 'FAULTY')
-                           and isinstance(volume.get('size-in-gbs'), int) and volume['size-in-gbs'] > 0,
+                      need(volume.get('lifecycle_state') in ('AVAILABLE', 'PROVISIONING', 'RESTORING', 'TERMINATING', 'FAULTY')
+                           and isinstance(volume.get('size_in_gbs'), int) and volume['size_in_gbs'] > 0,
                            'Cannot confirm free storage capacity. Confirm manually.')
-                      storage += volume['size-in-gbs']
+                      storage += volume['size_in_gbs']
               need(storage + 50 <= 200, 'Insufficient free tenancy storage for a 50 GB boot disk. Confirm manually.')
-              return [chosen] if chosen else ads
+              return chosen or sorted(ads)[0]
 
           def reconcile():
               # A failed/partial launch may already have been accepted. Never launch again.
@@ -357,42 +299,48 @@ jobs:
               finish('Launch outcome unknown. Check OCI instances and boot volumes manually before re-enabling.',
                      detail=detail or diagnostic_detail(category='unknown_result'))
 
-          def hunt(ads, images):
+          def hunt(ad):
+              global stage
               for shape in (ARM, AMD):
-                  image_id = images[shape]
-                  for ad in ads:
-                      # A rejected ARM attempt can leave storage behind; recheck before AMD too.
-                      need(ad in preflight(), 'AD configuration changed during this run. Confirm manually.')
-                      check_target()
-                      need(time.monotonic() - started < 900, 'Run budget exhausted before creation. Check manually.')
-                      args = ['compute', 'instance', 'launch', '--compartment-id', env['OCI_COMPARTMENT_ID'],
-                              '--availability-domain', ad, '--shape', shape, '--subnet-id', env['OCI_SUBNET_ID'],
-                              '--source-details', json.dumps({'sourceType': 'image', 'imageId': image_id,
-                                  'bootVolumeSizeInGBs': 50, 'bootVolumeVpusPerGB': 10}),
-                              '--ssh-authorized-keys-file', env['HUNT_SSH_FILE'],
-                              '--assign-public-ip', 'true', '--capacity-reservation-id', '',
-                              '--display-name', 'always-free-v3-1']
-                      if shape == ARM:
-                          args += ['--shape-config', '{"ocpus":2,"memoryInGBs":12}']
-                      try:
-                          result = oci(*args, launch=True)
-                      except OciError as error:
-                          if error.status == 429:
-                              return
-                          if error.status == 500 and error.code == 'InternalError' and isinstance(error.message, str) \
-                                  and error.message.strip().lower().rstrip('.') == 'out of host capacity':
-                              continue
-                          if error.status in (400, 401, 403, 404, 409, 422):
-                              finish('OCI rejected creation (authentication, quota or configuration). Check manually.',
-                                     detail=diagnostic_detail(error))
-                          reconcile()
-                      else:
-                          if isinstance(result, dict) and result.get('id') \
-                                  and result.get('shape') == shape and result.get('lifecycle-state') in VALID:
-                              finish('Created ' + ('ARM 2 OCPU / 12 GB' if shape == ARM else 'AMD Micro fallback')
-                                     + ' with a 50 GB boot disk; no further creation.', success=True)
-                          reconcile()
-              # Every attempted shape/AD explicitly rejected due to host capacity: silent.
+                  # Resolve AMD only after an unambiguous ARM capacity rejection.
+                  image_id = image_for(shape)
+                  need(ad == preflight(), 'AD configuration changed during this run. Confirm manually.')
+                  check_target()
+                  need(time.monotonic() - started < 900, 'Run budget exhausted before creation. Check manually.')
+                  need(not diagnostic_only, 'Diagnostic mode forbids creation.')
+                  details = sdk.core.models.LaunchInstanceDetails(
+                      compartment_id=env['OCI_COMPARTMENT_ID'], availability_domain=ad,
+                      shape=shape, display_name='always-free-sdk', capacity_reservation_id='',
+                      create_vnic_details=sdk.core.models.CreateVnicDetails(
+                          subnet_id=env['OCI_SUBNET_ID'], assign_public_ip=True),
+                      source_details=sdk.core.models.InstanceSourceViaImageDetails(
+                          image_id=image_id, boot_volume_size_in_gbs=50, boot_volume_vpus_per_gb=10),
+                      metadata={'ssh_authorized_keys': env['SSH_PUBLIC_KEY'].strip()},
+                      shape_config=(sdk.core.models.LaunchInstanceShapeConfigDetails(ocpus=2, memory_in_gbs=12)
+                                    if shape == ARM else None))
+                  stage = 'launch_arm' if shape == ARM else 'launch_amd'
+                  try:
+                      response = query(stage, compute.launch_instance, launch_instance_details=details,
+                                       opc_retry_token=str(uuid.uuid4()))
+                      result = sdk.util.to_dict(response.data)
+                  except OciError as error:
+                      if error.status == 429:
+                          print('Round stopped: stage=' + stage + ' category=rate_limit http=429')
+                          return
+                      if error.status == 500 and error.code == 'InternalError' and isinstance(error.message, str) \
+                              and error.message.strip().lower().rstrip('.') == 'out of host capacity':
+                          continue
+                      if error.status in (400, 401, 403, 404, 409, 422) or error.code == 'LimitExceeded':
+                          finish('OCI rejected creation. Check IAM, quota and configuration before re-enabling.',
+                                 detail=diagnostic_detail(error))
+                      reconcile()
+                  else:
+                      if isinstance(result, dict) and result.get('id') \
+                              and result.get('shape') == shape and result.get('lifecycle_state') in VALID:
+                          finish('Created ' + ('ARM 2 OCPU / 12 GB' if shape == ARM else 'AMD Micro fallback')
+                                 + ' with a 50 GB boot disk; no further creation.', success=True)
+                      reconcile()
+              print('Round complete: category=capacity_unavailable; ARM and AMD rejected; no instance accepted.')
 
           try:
               need(env.get('HUNT_DIAGNOSTIC_ONLY', 'false') in ('true', 'false'), 'Invalid execution mode.')
@@ -409,38 +357,43 @@ jobs:
                    'Invalid credential format. Check Secrets manually.')
               need(re.fullmatch(r'(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)) [A-Za-z0-9+/=]+(?: [^\r\n]*)?',
                                 env['SSH_PUBLIC_KEY'].strip()), 'SSH_PUBLIC_KEY must contain one public key.')
-              with tempfile.TemporaryDirectory(prefix='oci-hunt-') as directory:
-                  os.chmod(directory, 0o700)
-                  for key, filename, content in (
-                      ('OCI_CLI_KEY_FILE', 'api.pem', env.pop('OCI_CLI_KEY_CONTENT')),
-                      ('HUNT_SSH_FILE', 'ssh.pub', env['SSH_PUBLIC_KEY'])):
-                      path = Path(directory) / filename
-                      path.touch(mode=0o600)
-                      path.write_text(content.strip() + '\n')
-                      env[key] = str(path)
-                  env['OCI_CLI_AUTH'] = 'api_key'
-                  # Capture installation diagnostics; dependency failures get a sanitized alert.
-                  stage = 'cli_install'
-                  try:
-                      install = subprocess.run([sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check',
-                                                'oci-cli==3.94.2'], capture_output=True, text=True, timeout=180)
-                  except subprocess.TimeoutExpired:
-                      raise OciError(category='timeout') from None
-                  except OSError:
-                      raise OciError(category='transport') from None
-                  need(install.returncode == 0, 'OCI CLI installation failed. Inspect runner dependencies manually.')
-                  try:
-                      ads = preflight()
-                      images = {shape: image_for(shape) for shape in (ARM, AMD)}
-                  except OciError as error:
-                      finish('Initial AD, image or safety discovery failed. Confirm manually.', detail=diagnostic_detail(error))
-                  if diagnostic_only:
-                      inventory(env['OCI_COMPARTMENT_ID'])
-                      print('Diagnostic-only complete: stage=target_instances category=checks_passed http=none; no launch, notification or disable.')
-                      raise SystemExit(0)
-                  check_target()
-                  hunt(ads, images)
+              # Install before importing SDK; never print installer or SDK exception bodies.
+              stage = 'sdk_install'
+              try:
+                  install = subprocess.run([sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check',
+                                            'oci==2.187.2'], capture_output=True, text=True, timeout=180)
+              except subprocess.TimeoutExpired:
+                  raise OciError(category='timeout') from None
+              except OSError:
+                  raise OciError(category='transport') from None
+              need(install.returncode == 0, 'OCI SDK installation failed. Inspect runner dependencies manually.')
+              stage = 'credentials'
+              import oci as sdk
+              no_retry = sdk.retry.NoneRetryStrategy()
+              # No ~/.oci/config and no credential files. Signer consumes the runtime Secret in memory.
+              logging.disable(logging.CRITICAL)
+              # SDK 2.187.2 has a separate header-parser retry loop: explicitly disable it too.
+              env['OCI_HEADER_PARSING_ERROR_MAX_RETRIES'] = '0'
+              config = dict(region=REGION, log_requests=False,
+                            tenancy=env['OCI_CLI_TENANCY'], user=env['OCI_CLI_USER'],
+                            fingerprint=env['OCI_CLI_FINGERPRINT'], key_content=env.pop('OCI_CLI_KEY_CONTENT'))
+              signer = sdk.signer.Signer(config['tenancy'], config['user'], config['fingerprint'],
+                                         None, private_key_content=config['key_content'])
+              options = dict(signer=signer, retry_strategy=no_retry, timeout=(10, 30))
+              identity = sdk.identity.IdentityClient(config, **options)
+              compute = sdk.core.ComputeClient(config, **options)
+              network = sdk.core.VirtualNetworkClient(config, **options)
+              storage_client = sdk.core.BlockstorageClient(config, **options)
+              check_target()
+              ad = preflight()
+              if diagnostic_only:
+                  image_for(ARM)
+                  image_for(AMD)
+                  print('Diagnostic-only complete: category=checks_passed; no launch, notification or disable.')
+                  raise SystemExit(0)
+              hunt(ad)
           except OciError as error:
+              # Ordinary query throttling stops this round silently; reconcile() handles uncertain launches separately.
               if diagnostic_only or error.status != 429:
                   finish('OCI inventory, image or preflight query failed. No further creation; check permissions/configuration.',
                          detail=diagnostic_detail(error))
