@@ -231,7 +231,7 @@ class Acceptance(unittest.TestCase):
 
     def test_01_workflow_contract(self):
         doc = yaml.load(TEXT, Loader=yaml.BaseLoader)
-        self.assertEqual(doc['on']['schedule'], [{'cron': '*/15 * * * *'}])
+        self.assertEqual(doc['on']['schedule'], [{'cron': '7,22,37,52 * * * *'}])
         self.assertEqual(doc['permissions'], {'actions': 'write'})
         self.assertEqual(doc['concurrency'], {'group': 'oracle-free-vm-hunt', 'cancel-in-progress': 'false'})
         self.assertEqual(doc['jobs']['hunt']['env']['HUNT_DIAGNOSTIC_LOCK'], 'false')
