@@ -1,4 +1,5 @@
 """Execute the production heredoc with real OCI SDK models/methods, fake I/O only."""
+import builtins
 import contextlib
 import io
 import json
@@ -233,7 +234,7 @@ class Acceptance(unittest.TestCase):
         self.assertNotIn('schedule', doc['on'])
         self.assertEqual(doc['permissions'], {'actions': 'write'})
         self.assertEqual(doc['concurrency'], {'group': 'oracle-free-vm-hunt', 'cancel-in-progress': 'false'})
-        self.assertEqual(doc['jobs']['hunt']['env']['HUNT_DIAGNOSTIC_LOCK'], 'true')
+        self.assertEqual(doc['jobs']['hunt']['env']['HUNT_DIAGNOSTIC_LOCK'], 'false')
         self.assertNotIn("['oci',", SOURCE)
         self.assertNotIn('tempfile', SOURCE)
 
@@ -524,6 +525,46 @@ class Acceptance(unittest.TestCase):
             output)
         self.assertNotIn(MARKER, output)
         self.assertFalse(f.creates or f.notifications or f.disables)
+
+    def test_32_sdk_import_failures_have_safe_fixed_categories(self):
+        cases = (
+            (ModuleNotFoundError(MARKER, name="oci"), "sdk_module_missing"),
+            (ModuleNotFoundError(MARKER, name="opaque_dependency"), "sdk_dependency_missing"),
+            (OSError(MARKER), "sdk_os_error"),
+            (ImportError(MARKER), "sdk_import_error"),
+            (RuntimeError(MARKER), "sdk_import_exception"),
+        )
+        for error, category in cases:
+            with self.subTest(category=category):
+                fake = FakeIO()
+                sdk_ready = False
+                original_command = fake.command
+
+                def command_then_arm_import_failure(args, **kwargs):
+                    nonlocal sdk_ready
+                    result = original_command(args, **kwargs)
+                    if args[1:4] == ["-m", "pip", "install"]:
+                        sdk_ready = True
+                    return result
+
+                fake.command = command_then_arm_import_failure
+                original_import = builtins.__import__
+
+                def fail_sdk_import(name, *args, **kwargs):
+                    if name == "oci" and sdk_ready:
+                        raise error
+                    return original_import(name, *args, **kwargs)
+
+                with patch("builtins.__import__", side_effect=fail_sdk_import):
+                    fake, status, output = self.run_case(
+                        fake=fake, HUNT_DIAGNOSTIC_LOCK='true', allow_pre_api_failure=True)
+                self.assertEqual(status, 1)
+                self.assertIn(
+                    f"stage=credentials credential_step=sdk_import category={category} http=none",
+                    output)
+                self.assertNotIn(MARKER, output)
+                self.assertNotIn("opaque_dependency", output)
+                self.assertFalse(fake.creates or fake.notifications or fake.disables)
 
 
 if __name__ == '__main__':

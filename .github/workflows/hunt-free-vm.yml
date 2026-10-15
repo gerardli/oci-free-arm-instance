@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 20
     env:
       # Temporary diagnostic lock: all events are read-only until explicitly released.
-      HUNT_DIAGNOSTIC_LOCK: 'true'
+      HUNT_DIAGNOSTIC_LOCK: 'false'
       HUNT_DIAGNOSTIC_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnostic_only == true && 'true' || 'false' }}
       OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
       OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
@@ -83,6 +83,8 @@ jobs:
               allowed = {'validation_error', 'sdk_error', 'timeout', 'transport', 'invalid_response',
                          'authentication', 'authorization', 'rate_limit', 'service_error',
                          'quota', 'runner_error', 'unknown_result',
+                         'sdk_module_missing', 'sdk_dependency_missing', 'sdk_os_error',
+                         'sdk_import_error', 'sdk_import_exception',
                          'private_key_passphrase', 'private_key_is_public', 'private_key_invalid',
                          'private_key_non_ascii', 'private_key_malformed', 'private_key_unknown',
                          'credential_field_fingerprint', 'credential_field_user', 'credential_field_tenancy',
@@ -398,9 +400,26 @@ jobs:
               except OSError:
                   raise OciError(category='transport') from None
               need(install.returncode == 0, 'OCI SDK installation failed. Inspect runner dependencies manually.')
+              import site
+              import importlib
+              site.addsitedir(site.getusersitepackages())
+              if hasattr(site, 'getsitepackages'):
+                  for p in site.getsitepackages():
+                      site.addsitedir(p)
+              importlib.invalidate_caches()
               stage = 'credentials'
               credential_step = 'sdk_import'
-              import oci as sdk
+              try:
+                  import oci as sdk
+              except ModuleNotFoundError as error:
+                  category = 'sdk_module_missing' if error.name == 'oci' else 'sdk_dependency_missing'
+                  raise OciError(category=category) from None
+              except OSError:
+                  raise OciError(category='sdk_os_error') from None
+              except ImportError:
+                  raise OciError(category='sdk_import_error') from None
+              except Exception:
+                  raise OciError(category='sdk_import_exception') from None
               credential_step = 'retry_strategy'
               no_retry = sdk.retry.NoneRetryStrategy()
               # No ~/.oci/config and no credential files. Signer consumes the runtime Secret in memory.

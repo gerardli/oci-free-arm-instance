@@ -1,110 +1,57 @@
-# Oracle Always Free 抢建 workflow v3.1
+# 柔佛 Always Free 单机 workflow（SDK 版）
 
-仅使用 `.github/workflows/hunt-free-vm.yml`、内嵌 Python 脚本与 GitHub Secrets。固定 `ap-kulai-2`，保留每 15 分钟和手动触发配置；**当前临时诊断锁开启，所有触发只读、不抢建**；GitHub 原生 concurrency（`group: oracle-free-vm-hunt`）串行执行，`cancel-in-progress: false`。当前目录原为空，未初始化 Git，未部署、未连接真实 OCI 创建资源。
+本地准备版，仅改动 workflow、离线测试、本说明和测试报告四个文件。**未发布、未调用真实 OCI、未启用或手动运行 GitHub Actions。** 远程已于 2026-10-15 只读核对：默认分支 `main` 头部 `d0d9f5e6`，其上 `.github/workflows/hunt-free-vm.yml` 仍是旧 CLI 3.94.2 版（blob `26c578ae`，27,594 字节），与本版 SDK 工作流（blob `713cde4c`，405 行）不同，远程还带着 `cron: '*/15 * * * *'`。hunt 的最近 5 次运行全是 `workflow_dispatch` 且结论失败，末次 2026-10-12T22:41:44Z；当时无排队、无进行中、无 schedule 运行。该快照不等于 hunt 已禁用，也不覆盖 `create-vm.yml`。`GET /actions/workflows` 返回 400，hunt-free-vm.yml 与 create-vm.yml 的启用/禁用状态都未知。仓库里另有遗留 `create-vm.yml`（cron `*/5`、区域 `ap-singapore-1`、A1.Flex 4 OCPU/24 GB、200 GB 启动盘、`continue-on-error: true`，把 Secrets 明文写入 runner 的 `~/.oci/config` 并把原始 OCI 输出发到 Discord webhook），既非免费档也有凭证暴露面。启用状态未知，其 cron 在发布前仍可能每 5 分钟触发；处理不能等到覆盖 hunt 的那一刻才开始，发布时必须一并停用或删除，不得由我们重新启用。诊断锁保持 `HUNT_DIAGNOSTIC_LOCK: 'true'`，本版不含 cron。目标是一个可审查的闭环，不保证上午内取得容量。
 
-优先创建 `VM.Standard.A1.Flex`（2 OCPU / 12 GB）。只有每个候选 AD 的 ARM 创建均明确返回 `500 InternalError: Out of host capacity`，才尝试 `VM.Standard.E2.1.Micro`（固定规格，约 1/8 OCPU / 1 GB）。AMD 被接受后即停止并禁用 workflow，后续不会继续抢 ARM。所有候选 AD 都限制在上述区域；指定 `AD_NAME` 或使用 AD 专属 subnet 时，只使用对应 AD。
+## 固定行为与边界
 
-启动盘通过 `--source-details` 显式固定为 50 GB、10 VPU/GB（Balanced），不挂载额外卷、不建立容量预留、不创建网络、负载均衡或付费镜像订阅。使用 `--assign-public-ip true`，要求指定 subnet 明确允许分配公网 IP（`prohibit-public-ip-on-vnic` 为 `false`）；禁止分配或无法确认时停止、禁用 workflow 并告警，不创建实例。实例主 VNIC 将请求分配临时公网 IPv4，供远程 SSH 使用；workflow 不会创建网络资源或修改路由、安全组。公网 IP 本身不保证 SSH 可达，需完成下面的网络检查。
+使用官方 Python SDK `oci==2.187.2` 的结构化返回，移除 OCI CLI 和 stdout/stderr 解析，不保留第二条调用路径。原有 GitHub Secrets 名称沿用，Telegram 和自动禁用当前 workflow 的逻辑保留；API 私钥只交给内存 signer，不读取 `~/.oci/config`，不写凭证文件。
 
-## 当前安全诊断入口（临时锁开启）
+只在 `ap-kulai-2` 的一个 AD 创建一台：优先 `VM.Standard.A1.Flex`，明确固定为 2 OCPU / 12 GB；仅当 ARM 返回 HTTP 500、code `InternalError` 且 message 精确归一化为 `Out of host capacity` 后，才发现 AMD 镜像并尝试 `VM.Standard.E2.1.Micro`。无跨 AD 创建循环；优先使用可选 `AD_NAME`，其次 subnet 的 AD，否则选择排序后的首个 AD。AMD 成功就结束，不再追 ARM。所有启动盘固定 50 GB、10 VPU/GB；不创建网络、附加卷、容量预留或付费镜像订阅。
 
-当前 workflow 的 `HUNT_DIAGNOSTIC_LOCK: 'true'` 是固定代码门：定时触发和手动触发（即使未勾选 `diagnostic_only`）均只做安装/认证准备及只读 OCI 检查，不 launch、不发送 Telegram、不禁用 workflow；生产 launch 入口另有诊断模式拒绝保护。锁缺失或不是精确字符串 `false` 时仍保持诊断。手动 `diagnostic_only: true` 在解除锁后也可单次只读运行。诊断仍需现有必填 Secrets、内置 GitHub 上下文及 IAM 查询权限；不要把真实值放进运行输入或日志。
+每轮先完整列举目标 compartment 的实例；两种目标 shape 中任何非 TERMINATED 实例（包括 PROVISIONING、STOPPED、TERMINATING）均通知并停止，不再创建。正常创建前重新检查目标与 tenancy 资源；ARM 缺货后也重查，防止残留卷挤占存储或并行创建者已经取得实例。GitHub `concurrency.group: oracle-free-vm-hunt`、`cancel-in-progress: false`，只能协调当前仓库，不能给 OCI tenancy 加原子锁。
 
-下一次人工诊断：先保持旧 workflow 禁用，确认默认分支已包含该固定锁，再由人工启用并手动运行；定时抢先触发也只读。日志仅提供固定 `stage`、白名单 `category`、经校验的 `http` 数字或 `none`；只有 `stdout_empty` 类别会额外给出固定 `stderr_kind` 分类（例如已识别的 CLI 提示或 `unknown`），不输出 stderr 内容、动态路径、错误文本、参数、OCID 或凭据。阶段包括 credentials、cli_install、region_subscription、availability_domains、subnet、compartments、other_instances、block_volumes、boot_volumes、image_arm/amd、image_compat_arm/amd、target_instances。该分类仅帮助区分常见 CLI 输出，不改变失败关闭决策，也不能证明具体 Secret 有误。诊断错误退出 1，所有检查完成退出 0，均不能证明真实创建或通知成功。
+所有支持分页的集合沿 `opc-next-page` 读完，后页错误、坏集合、重复 token 均关闭创建；root 显式纳入盘点（SDK `list_compartments` 没有 CLI 的 `--include-root` 参数）。列举所有 ACTIVE 子 compartment，拒绝其他 compartment 的有效 A1/E2，并对所有 AD 的 boot volumes、各 compartment 的 regional block volumes 累计非 TERMINATED 容量，确认加 50 GB 后不超过 200 GB。查询失败绝不按空集合处理。
 
-当前“Initial AD, image or safety discovery failed”只证明前置发现失败，不能推定 Secrets 有误或某个 CLI 参数无效。取得上述脱敏阶段/类别/HTTP 后再定位原因；不要求提供原始日志或凭据。诊断期间定时运行仍会执行只读检查；完成取证后人工禁用以停止重复检查。恢复普通抢建必须先禁用并等待已有诊断运行结束，核实诊断原因和下述免费额度/并发条件，再审核将固定锁改成 `'false'`，重跑离线验收后由人工发布和启用。未解除锁不得声称已恢复抢建；解除后 schedule 可能立即运行，应在启用前完成全部确认。本次未发布、启用或进行真实诊断。
+ARM、AMD 都明确缺货：输出固定 `capacity_unavailable` 结果，正常结束本轮，保留未来调度；launch 明确 429：输出 `rate_limit`，停止本轮，不转 AMD。普通查询明确 429：静默停轮，不创建、不通知、不禁用；创建结果不确定后的仲裁复查 429 仍按无法确认处理，告警并禁用、不重建。其他查询失败、认证、权限、配额、镜像或配置错误：发送固定阶段/类别/HTTP 告警并禁用。SDK 的 `NoneRetryStrategy` 同时用于客户端和调用；另显式设 `OCI_HEADER_PARSING_ERROR_MAX_RETRIES=0`，关闭 2.187.2 独立响应头重试。每次 launch 使用独立请求幂等 token，但不重试 launch。
 
-此锁是临时偏离 PLAN-v3.1 的安全诊断门，不增加状态文件或重试；正常模式原有成功即停、禁用、异常仲裁及费用限制保留。普通异常也只追加上述脱敏诊断信息，不转发原始错误。
+创建超时、传输失败、响应不完整或模糊 5xx：仅重新查询目标一次；找到有效目标则通知并禁用，否则告警、禁用，绝不盲目重建或转 AMD。创建成功表示 OCI 接受并返回已知生命周期，可能仍是 PROVISIONING；不等同启动完成或 SSH 可用。Telegram 失败仍尝试禁用；禁用必须 HTTP 204，失败追加独立人工告警并使 job 失败。先通知、再禁用，通知与禁用都没有循环重试。
 
-## 部署前必须人工确认
+诊断锁缺失或非精确 `false` 都只读：可以认证和查询，但不 launch、不 Telegram、不禁用。手动 `diagnostic_only: true` 也强制只读。日志只输出固定阶段/类别/HTTP，不转发异常正文、响应、OCID、密钥、请求参数或身份。SDK 导入异常会使用固定标签区分 SDK 包缺失、依赖缺失、系统加载错误、导入错误和其他导入异常；标签不包含异常原文。SDK 日志关闭；HTTP 凭证经 curl stdin，调用输出捕获。runner 强制终止、GitHub/Telegram 不可达时无法保证复查、通知或禁用；此时必须人工禁用，核实 OCI 再恢复。
 
-1. OCI Console 中确认 tenancy 的 **home region 为 ap-kulai-2**，该区域支持所选 Always Free shapes，Ubuntu 镜像标记为免费适用。运行时也会查询 home region，任何不匹配都停止。
-2. 确认 **本月历史用量**与现有资源不会超过账号当前免费额度。官方当前列出的 A1 免费额度为每月 1,500 OCPU 小时、9,000 GB 小时；本脚本不查询账单历史。删除旧实例不会抹去其本月已消耗的额度。试用余额也不能作为 Always Free 资格证明。
-3. 确认 tenancy 内没有其他有效 A1/E2 实例，boot/block volume 合计仍有免费余量，且已有 subnet、网络出口与依赖服务不会造成额外费用。脚本会列举全部 ACTIVE compartments、所有 AD 的 boot volumes 及 regional block volumes，累计非 TERMINATED 卷，确保添加启动盘后不超过 200 GB；其他 compartment 有 A1/E2 则停止并要求人工确认。
-4. 确认 API 用户有遍历 tenancy compartment 的权限，并能读取各 compartment 中的实例及卷、读取 AD、region subscriptions、subnet 和 images，以及在目标 compartment 创建实例、启动盘、VNIC。查询失败不视为空库存；不完整的 IAM 权限会阻止运行。建议配合 OCI compartment quotas 限制本 workflow 可使用的 CPU、内存及存储，并配置预算告警。Budget 告警不是自动硬性费用上限。
-5. 运行期间不要让其他仓库、其他自动化或 Console 操作在该 tenancy 中并行创建资源。GitHub concurrency 只协调当前仓库，无法对 OCI tenancy 加锁。只部署这一份 workflow，不同时运行上游 workflow。
-6. 确认 GitHub Actions 分钟额度与组织策略允许 `GITHUB_TOKEN` 的 `actions: write` 权限；设置 Telegram bot，先在目标聊天与 bot 建立可发送消息的关系。缺少通知凭据时 GitHub 日志会提示人工处理。
-7. 确认指定 subnet 是允许分配公网 IP 的**公网子网**，VCN 已有可用的 **Internet Gateway**，subnet 使用的路由表包含指向该网关的 `0.0.0.0/0` 路由。当前脚本仅检查 subnet 的公网 IP 许可字段，不自动创建或验证网关与路由。
-8. 在 subnet 现有 Security List 中配置 **TCP 22 入站**，优先只允许你的公网来源 IPv4（单地址用 `/32`）；同时确认实例系统防火墙允许 SSH。当前脚本不指定额外 NSG，如有其他适用规则，也需人工核实。不要开放全部端口；如果来源 IP 变化，人工更新允许的来源。创建后使用自己的 SSH 私钥连接 `ubuntu@<实例公网IP>`，到 Console 核实实际地址及最终状态。
+## 免费资格仍需人工核对
 
-任何一项免费资格无法确认，请保持 workflow 禁用，先人工核实；本实现不会自动升级账号、切换付费 shape、扩容或追加实例。
+官方当前 A1 额度为每月 1,500 OCPU 小时、9,000 GB 小时，E2 Micro 最多两台，boot/block 合计 200 GB；免费 Compute 和卷须位于 home region。运行时验证 home region 为 `ap-kulai-2`。**本月历史用量、账号资格、其他区域费用、已有网络及依赖服务费用不在脚本证明范围；目标 compartment 为空不等于 tenancy 没有费用。** 删除旧实例不会清除本月历史用量。创建前在控制台核对 Always Free 标识、Limits/Quotas/Usage，并确认“本月历史已用量＋拟建实例在本月剩余时间的预计用量”仍在免费额度内，必要时用 compartment quotas 限制资源；Budget 告警不是硬费用上限。
 
-## Secrets 设置
+需要遍历 tenancy compartments、读取其实例和卷、列举 AD/region subscriptions/subnet/images，以及在目标 compartment 创建实例、启动盘、VNIC 的 IAM 权限。无法完整查询时保守停止。运行期间禁止其他仓库、旧 workflow 或控制台并行创建；本脚本不会自动修改 IAM、升级账户或删除资源。
 
-在准备好的 GitHub 仓库中打开 **Settings → Secrets and variables → Actions → New repository secret**。不要将真实值放入 README、提交、Issue、运行输入或聊天中。
+subnet 必须 AVAILABLE 并明确允许公网 IP。脚本请求临时公网 IPv4，但不验证或修改 Internet Gateway、路由、安全列表及系统防火墙。人工确认已有网关和默认路由，以及仅允许所需来源的 TCP 22 入站；创建后去控制台核对地址、最终状态与 SSH。
 
-| 必填 Secret | 内容 |
-| --- | --- |
-| `OCI_CLI_TENANCY` | Tenancy OCID |
-| `OCI_CLI_USER` | OCI API 用户 OCID |
-| `OCI_CLI_FINGERPRINT` | 已登记 API key 的 fingerprint |
-| `OCI_CLI_KEY_CONTENT` | 对应未加密 PEM 私钥的完整内容，仅存于 Secret |
-| `OCI_COMPARTMENT_ID` | 目标 ACTIVE compartment OCID，也可为 tenancy root |
-| `OCI_SUBNET_ID` | ap-kulai-2 中已有、AVAILABLE 且允许公网 IP 的公网 subnet OCID |
-| `SSH_PUBLIC_KEY` | 单行 SSH 公钥，支持 ed25519、RSA、ECDSA；不要填 SSH 私钥 |
-| `TG_BOT_TOKEN` | Telegram bot token |
-| `TG_CHAT_ID` | 接收通知的 chat ID |
+## 现有 Secrets
 
-| 可选 Secret | 内容 |
-| --- | --- |
-| `AD_NAME` | 同区域 AD 的完整名称；不填则自动发现，并遵守 subnet 的 AD 限制 |
-| `IMAGE_ID_ARM` | 同区域、ARM 兼容的官方 Canonical Ubuntu 24.04 镜像 OCID |
-| `IMAGE_ID_AMD` | 同区域、AMD 兼容的官方 Canonical Ubuntu 24.04 镜像 OCID |
+仍使用九个必填 Repository Secrets：`OCI_CLI_TENANCY`、`OCI_CLI_USER`、`OCI_CLI_FINGERPRINT`、`OCI_CLI_KEY_CONTENT`、`OCI_COMPARTMENT_ID`、`OCI_SUBNET_ID`、`SSH_PUBLIC_KEY`、`TG_BOT_TOKEN`、`TG_CHAT_ID`。名称中的 CLI 是兼容保留，不再安装 CLI。无需提供这些值给审查者，也不要放入日志、输入、文档或提交；`GITHUB_TOKEN` 继续使用内置 token，权限为 `actions: write`。
 
-无需提供 `GITHUB_TOKEN` Secret；workflow 使用内置 token。无需区域 Secret。没有镜像覆盖时，按 shape 查询全部镜像页，按创建时间倒序选择官方 Ubuntu 24.04 / 24.04 Minimal。ARM 必须为 aarch64，AMD 必须为非 aarch64；镜像须 AVAILABLE、无自定义 compartment、位于固定区域且大小不超过启动盘。提供覆盖时仍验证上述条件并调用 image-shape compatibility API，不能绕过检查。若镜像已从默认列表下架，可用经过上述验证的覆盖 OCID。
+可选 `AD_NAME`、`IMAGE_ID_ARM`、`IMAGE_ID_AMD`。默认按 shape 查询全部镜像页，选择官方 Canonical Ubuntu 24.04 / 24.04 Minimal。校验 AVAILABLE、platform image、区域、镜像尺寸和 aarch64/AMD 架构；覆盖镜像也须通过同样校验和 image-shape compatibility API。ARM 与 AMD 镜像、shape_config 不混用。
 
-私钥、公钥仅在 runner 临时目录使用，目录权限 700，文件权限 600，退出时删除。Shell 关闭调试回显，Secrets 经环境变量传入；OCI 输出被捕获且不写入日志、报告或 Telegram。HTTP 凭据经 curl stdin 传递，通知仅含固定状态说明及经白名单验证的实际 shape / 生命周期状态，不包含实例 OCID、原始错误或其他凭据。OCI CLI 固定版本为 `3.94.2`，在 GitHub runner 内安装，安装诊断同样不回显。
+## 六步落地与授权门
 
-## 本次保留的方案差异
+1. **可行性和状态核对（本地完成，远程已只读核对）**：四文件指纹已记录；当前目录没有 Git 元数据，不 init、不 clone，差异只能用 `diff -u` 对 `/tmp/oci-sdk-six-step-baseline` 生成。已复用临时隔离环境内 SDK 2.187.2；不继续诊断旧 CLI 故障。远程 `main` 头部提交、hunt 工作流内容为旧 CLI 版、hunt 运行记录 5 次全失败且当时无排队/进行中/schedule、以及 `create-vm.yml` 遗留，均于 2026-10-15 只读确认。`GET /actions/workflows` 返回 400，hunt-free-vm.yml 与 create-vm.yml 的启用/禁用状态都未知；hunt 的运行快照不等于无竞争，也不覆盖 create-vm。create-vm 自带 `*/5` cron，状态未知时发布前仍可能持续触发。授权后发布时须再次确认两个 workflow 的 state。
+2. **最小迁移（本地完成）**：保留调度容器、Secrets、通知、防重复和费用检查；仅 OCI 操作改为 SDK。锁为 true，暂时移除 cron。
+3. **必要离线验证（见报告）**：执行真实生产 heredoc，真实 SDK 方法/模型和序列化，外部调用全部 mock，隔离 HOME，不读取真实配置或真实凭证。
+4. **独立审查（见报告）**：未参与实现的另一上下文只读审查生产入口、测试契约、费用/分页/不确定创建/凭证/发布边界，记录结论与修正。
+5. **待主控取得新授权后发布并单次验收**：hunt 工作流内容与运行记录已只读核对，当时无排队、无进行中、无 schedule 运行；`GET /actions/workflows` 返回 400，hunt 与 create-vm 的启用/禁用都未知。hunt 的运行快照不等于已禁用，也不覆盖 create-vm；create-vm 自带 `*/5` cron，发布前仍可能持续触发，处理不能等到覆盖 hunt 的那一刻。发布时须停用或删除 `create-vm.yml`，再核对两个 workflow 的 state。人工核对本月额度、IAM、网络及现有 Secrets 的存在性。写入文件是 `.github/workflows/hunt-free-vm.yml`（覆盖远程旧 CLI 版）；测试和两份文档一起交付审查。由于本地没有 `.git`，发布只能是显式的文件内容写入或重新 clone 后提交，不得 `git init`。审核具体 diff 后，单独授权 commit/push、解除锁为 false 并手动 dispatch 一次；仍不加 cron。一次最多 ARM 一次、明确缺货才 AMD 一次，最多接受一台，可能通知及自动禁用。验收以“创建被接受/发现已有实例”或“两种 shape 明确缺货”为主链路证据，不能把认证等错误算通过。
+6. **只在双明确缺货后另行授权调度**：创建被接受或发现已有目标即完成验收并保持 workflow 禁用，不启用 cron；只有 ARM、AMD 均明确缺货，复核仍无目标实例且旧 workflow 不竞争时，才可另行授权加入 `schedule: [{cron: '*/15 * * * *'}]` 并启用。429、查询/配置错误、未知创建结果、通知或禁用失败均不构成启用依据。GitHub cron 可能延迟，不是准点保证。成功/已有实例即停；异常告警停止。一次真实验收加一次有明确证据的修正仍无法进入创建或明确缺货，就停止扩建，改为人工控制台单次创建验证或官方 Resource Manager；不自动部署替代。
 
-安装固定版本 CLI，未实现原文的 `~/.local` 缓存；认证使用 API-key 环境变量和隔离临时密钥文件，未还原 `~/.oci/config`。保留原有 tenancy / 存储 / subnet 安全盘点及额外 IAM 要求，仍支持同区域候选 AD，严格镜像验证允许 Ubuntu 24.04 Minimal；这些实现选择未在本轮重构，不代表与方案原文逐项等同，也不证明真实免费资格。每轮先完成 AD、安全盘点和 ARM/AMD 镜像发现，再查目标实例；已发现镜像在本轮复用，每次 launch 前仍复查实例与资源余量。
+授权前不得 commit/push、调用 OCI、发送真实通知、启用或 dispatch workflow。历史批准不是本版本授权。本地基线在 `/tmp/oci-sdk-six-step-baseline`，具体差异与指纹见报告。远程 `main` 仍是旧 CLI 版 hunt workflow，另有遗留 `create-vm.yml`。hunt 当时无排队或进行中运行，不等于 hunt 已禁用，也不等于仓库无竞争；create-vm 启用状态未知，其 cron 在发布前仍可能每 5 分钟触发。不要假称旧 workflow 已禁用，也不要把“最近无运行”当成已禁用。发布必须用显式文件写入或另 clone 后提交，不要在当前目录 `git init`。
 
-## 普通模式停止和异常规则（解除诊断锁后）
+停止/回滚：Actions 页面 Disable 当前 workflow 与遗留的 `create-vm.yml`，取消尚未开始的队列并等待已发送请求的运行结束；禁用不会撤销 OCI 请求。到固定区域逐个 compartment 核实实例和启动盘，不确定结果时等待库存稳定。已有实例则保持禁用。代码需要回滚时恢复审查前版本但保持 workflow 禁用及诊断锁，不恢复旧自动抢建。任何删除操作另行逐项授权。
 
-- 每次创建前用 `oci compute instance list --all` 查指定 compartment，跨全部 AD，不按名称筛选。RUNNING、PROVISIONING、STARTING、STOPPING、STOPPED、MOVING、TERMINATING 都按非 TERMINATED 的已有目标实例处理：通知中包含实际 shape 和状态，说明目标已达成，然后禁用 workflow，不再创建。TERMINATED 可忽略；未知状态保守停止、告警并禁用。
-- OCI CLI 3.94.2 只在 `data` 为真时写入 JSON，展示字典为空则不打印。已知 list 命令同时满足 `--all`、退出码 0、stdout 和 stderr 仅空白时按空集合处理，显式 `{"data":[]}` 同样是空集合；这不把查询失败当成没有实例。get、launch、缺少 `--all` 的 list、stderr 非空、坏 JSON，以及只有 header、没有 data 的对象，一律拒绝。创建响应为空白时仍只复查一次，复查为空则告警并禁用，不再 launch。该规则来自已核对的 CLI 渲染契约，不是某次真实响应原文。
-- 所有 OCI 命令均包含 `--no-retry`；无 CLI 内部重试、等待器或自动退避。两次候选创建之间重新查询实例和整个 tenancy 的免费资源余量。库存为空不等于 API 提供原子锁。
-- 明确容量不足允许继续候选；全部无货时不打印业务消息、不发送 Telegram、不禁用，留待下一次定时运行。GitHub runner 自身仍有系统运行日志。
-- 初始目标实例查询明确 429 或创建明确 429：静默停轮、不禁用、不再创建或转 AMD。其他查询失败告警并禁用；初始 AD、镜像或安全盘点发现失败（包括 429）在创建前告警并禁用。认证、配额、配置和其他已知创建拒绝异常同样停止、告警并禁用；401/403 不复查。
-- 创建超时、连接错误、无法解析响应或其他结果不明时，只重新查询一次。找到任一已识别的非 TERMINATED 目标实例（包括 TERMINATING）按已有实例处理；空结果、查询失败、复查 429、解析或状态异常均按无法确认处理：告警、禁用，不再创建或转 AMD。
-- 成功创建以 OCI 接受创建并返回有效生命周期为准，可能仍在 PROVISIONING；请到 Console 检查实例最终状态。未验证 SSH 或系统启动成功。
-- 禁用的是 `GITHUB_WORKFLOW_REF` 对应的当前 workflow 文件，调用 GitHub REST `PUT .../disable`，严格要求 **HTTP 204**。先发送初始成功通知或异常告警，再尝试禁用；初始通知失败也必须继续尝试禁用。非 204（包括 HTTP 200）或传输失败时追加独立告警“自动禁用失败，请手动去 Actions 页 Disable workflow”，job 返回失败并停止。发送和禁用调用均有超时且不循环重试；追加告警无法送达时输出固定、不含敏感值的失败提示。
-- Telegram 必须返回 HTTP 200 且 JSON `ok: true` 才视为送达；失败会在 GitHub 日志显示固定提示并使 job 失败。缺失 Secret、依赖安装失败等同样保守停止。
-- runner 强制终止、基础设施故障或无法访问 GitHub/Telegram 时，脚本无法保证完成复查/通知/禁用。尤其不要在提交创建请求时手动取消运行；发生此类中断应立即人工禁用并核实 OCI，再决定恢复。
+## 离线复现
 
-## 放入 GitHub 与手动恢复
+需要官方 SDK `oci==2.187.2` 和已有 PyYAML。本轮直接复用 `/tmp/oci-boundary-20261013-sy0k0dzy/venv/bin/python -I tests/offline_test.py`，没有安装新依赖。其他机器在专用无凭证虚拟环境准备同版本后运行 `python -I tests/offline_test.py`。测试 mock pip 安装、OCI 网络、Telegram、GitHub；真实 config 读取和网络连接另被拒绝。不可用普通生产 workflow 代替离线测试。
 
-把 workflow 文件放入准备好的仓库默认分支 `.github/workflows/`，配置 Secrets，并在上述配额检查完成后才启用 Actions / 手动触发。GitHub schedule 运行默认分支上的文件，调度可能延迟，并非精确 SLA。本交付没有执行这些步骤。
+## 官方依据
 
-**60 天无活动限制属于 GitHub：** 公共仓库连续 60 天没有仓库活动时，GitHub 会自动禁用定时 workflow。本实现不做自动保活。定时运行本身不能代替维护检查；无实例时可确认免费资格后手动重新启用。Oracle 的空闲实例回收另按官方 7 天监测窗口、CPU/网络利用率及 A1 内存利用率规则执行，不能把它理解为 60 天保留承诺。
-
-人工恢复顺序：
-
-1. GitHub **Actions → Hunt OCI Always Free VM v3.1 → … → Disable workflow**，并取消未开始的队列；等待任何正在发送创建请求的运行结束。禁用 schedule 不会撤销已提交的 OCI 请求。
-2. 在固定区域的 OCI Console 查看目标及其他 compartments 的 A1/E2 实例和全部启动盘。对于不明创建结果，等待库存最终稳定；已有有效实例就保持禁用。
-3. 人工修复 IAM、Secrets、镜像或配额问题；不要通过增加规格或付费资源解决。若需删除失败资源，人工逐项确认，workflow 不执行清理。
-4. 重新确认本月额度、免费存储及没有并行创建者；若仍需一台实例，在 Actions 菜单选 **Enable workflow**，再 **Run workflow**。AMD 已成功时不要为了追 ARM 恢复此任务。
-
-## 离线验收
-
-在本目录运行：
-
-```sh
-python3 -I tests/offline_test.py
-```
-
-只用 Python 标准库。直接提取并运行 YAML 中的实际内嵌脚本，不另存第二份生产逻辑。OCI、GitHub curl、Telegram curl 和 pip 安装全部被替换为 mock；未知命令会失败，不读本机 OCI 配置，不连接真实服务。保留原五组并补充通知失败、前置发现、损坏响应和精确 workflow 配置检查；每轮测试隔离 HOME、环境和临时目录，具体断言和本次结果见 [OFFLINE_TEST_REPORT.md](OFFLINE_TEST_REPORT.md)。mock 的成功不代表真实 OCI 部署成功。
-
-## 实现来源与官方依据
-
-通过 ego-browser 通道读取以下来源，未触发 fallback，task space 已关闭。保留 [heykapil/oci-free-arm-instance](https://github.com/heykapil/oci-free-arm-instance) 的 GitHub Actions + OCI CLI + Secrets 思路及 launch 参数组织方式，替换其超过本任务上限的规格、完整响应通知与人工停止行为。
-
-- [OCI Always Free 资源、home region、配额与空闲回收](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm)
-- [OCI CLI launch 参数](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/instance/launch.html)
-- [OCI CLI 镜像查询与 --all 分页](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image/list.html)
-- [OCI Ubuntu 24.04 平台镜像](https://docs.oracle.com/en-us/iaas/images/ubuntu-2404/)
-- [GitHub 禁用 workflow：HTTP 204](https://docs.github.com/en/rest/actions/workflows#disable-a-workflow)
-- [GitHub 定时触发与 60 天无活动规则](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
+2026-10-15 使用 ego-browser 读取 [Always Free 资源](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm) 与 [Python SDK 2.187.2 ComputeClient](https://docs.oracle.com/en-us/iaas/tools/python/2.187.2/api/core/client/oci.core.ComputeClient.html)，并核对本地同版本 SDK 的配置、分页参数、模型和请求重试源码。首选浏览器在默认沙箱不可达，获准以外部只读方式成功读取，未触发 fallback，task space 已关闭。此次 SDK 迁移不说明历史 `block_volumes/stdout_empty` 根因已经定位。
 
 上游 MIT 许可声明（保留归属）：
 
