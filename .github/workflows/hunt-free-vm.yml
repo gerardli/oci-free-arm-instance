@@ -62,6 +62,7 @@ jobs:
           env = os.environ
           diagnostic_only = env.get('HUNT_DIAGNOSTIC_LOCK', 'true') != 'false' or env.get('HUNT_DIAGNOSTIC_ONLY', 'false') == 'true'
           stage = 'credentials'
+          credential_step = None
 
           class Halt(Exception):
               pass
@@ -87,7 +88,12 @@ jobs:
                          'credential_field_fingerprint', 'credential_field_user', 'credential_field_tenancy',
                          'credential_field_unknown'}
               category = category if category in allowed else 'sdk_error'
-              detail = 'stage=' + stage + ' category=' + category + ' http=' + (str(status) if status else 'none')
+              detail = 'stage=' + stage
+              if stage == 'credentials' and credential_step is not None:
+                  allowed_steps = {'sdk_import', 'retry_strategy', 'runtime_config', 'signer',
+                                   'identity_client', 'compute_client', 'network_client', 'blockstorage_client'}
+                  detail += ' credential_step=' + (credential_step if credential_step in allowed_steps else 'other')
+              detail += ' category=' + category + ' http=' + (str(status) if status else 'none')
               return detail
 
           def need(condition, reason):
@@ -172,8 +178,9 @@ jobs:
               raise SystemExit(0 if success and disabled and notified else 1)
 
           def query(label, method, **kwargs):
-              global stage
+              global stage, credential_step
               stage = label
+              credential_step = None
               try:
                   return method(retry_strategy=no_retry, **kwargs)
               except sdk.exceptions.ServiceError as error:
@@ -392,15 +399,19 @@ jobs:
                   raise OciError(category='transport') from None
               need(install.returncode == 0, 'OCI SDK installation failed. Inspect runner dependencies manually.')
               stage = 'credentials'
+              credential_step = 'sdk_import'
               import oci as sdk
+              credential_step = 'retry_strategy'
               no_retry = sdk.retry.NoneRetryStrategy()
               # No ~/.oci/config and no credential files. Signer consumes the runtime Secret in memory.
+              credential_step = 'runtime_config'
               logging.disable(logging.CRITICAL)
               # SDK 2.187.2 has a separate header-parser retry loop: explicitly disable it too.
               env['OCI_HEADER_PARSING_ERROR_MAX_RETRIES'] = '0'
               config = dict(region=REGION, log_requests=False,
                             tenancy=env['OCI_CLI_TENANCY'], user=env['OCI_CLI_USER'],
                             fingerprint=env['OCI_CLI_FINGERPRINT'], key_content=env.pop('OCI_CLI_KEY_CONTENT'))
+              credential_step = 'signer'
               try:
                   signer = sdk.signer.Signer(config['tenancy'], config['user'], config['fingerprint'],
                                              None, private_key_content=config['key_content'])
@@ -409,12 +420,18 @@ jobs:
               options = dict(signer=signer, retry_strategy=no_retry, timeout=(10, 30))
               # Client construction validates user/tenancy/fingerprint shape; label failures by field name.
               try:
+                  credential_step = 'identity_client'
                   identity = sdk.identity.IdentityClient(config, **options)
+                  credential_step = 'compute_client'
                   compute = sdk.core.ComputeClient(config, **options)
+                  credential_step = 'network_client'
                   network = sdk.core.VirtualNetworkClient(config, **options)
+                  credential_step = 'blockstorage_client'
                   storage_client = sdk.core.BlockstorageClient(config, **options)
               except sdk.exceptions.InvalidConfig as error:
                   raise OciError(category=credential_field_category(error)) from None
+              stage = 'target_check'
+              credential_step = None
               check_target()
               ad = preflight()
               if diagnostic_only:

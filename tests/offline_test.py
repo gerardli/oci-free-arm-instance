@@ -177,7 +177,7 @@ class FakeIO:
 
 
 class Acceptance(unittest.TestCase):
-    def run_case(self, fake=None, unmock_signer=False, **extra):
+    def run_case(self, fake=None, unmock_signer=False, allow_pre_api_failure=False, **extra):
         fake = fake or FakeIO()
         with tempfile.TemporaryDirectory(prefix='oci-sdk-test-') as home:
             env = dict(HOME=home, PATH=os.defpath, HUNT_DIAGNOSTIC_LOCK='false', HUNT_DIAGNOSTIC_ONLY='false',
@@ -210,9 +210,8 @@ class Acceptance(unittest.TestCase):
                         status = e.code
                     else:
                         status = 0
-                    # Credential-construction failures stop before any SDK call by design;
-                    # test_29 asserts that path directly. Every other run must reach the SDK.
-                    self.assertTrue(retry.called or unmock_signer)
+                    # Credential-construction failures stop before any SDK call by design.
+                    self.assertTrue(retry.called or unmock_signer or allow_pre_api_failure)
             finally:
                 logging.disable(old_logging)
             self.assertEqual(fake.unexpected, [])
@@ -513,6 +512,18 @@ class Acceptance(unittest.TestCase):
         self.assertFalse(f.creates)
         self.assertNotIn('aa:bb:cc', f.notifications[0])
         self.assertIn('credential_field_fingerprint', f.notifications[0])
+
+
+    def test_31_unexpected_client_setup_is_safely_staged(self):
+        with patch('oci.identity.IdentityClient', side_effect=RuntimeError(MARKER)):
+            f, status, output = self.run_case(
+                HUNT_DIAGNOSTIC_LOCK='true', allow_pre_api_failure=True)
+        self.assertEqual(status, 1)
+        self.assertIn(
+            'stage=credentials credential_step=identity_client category=runner_error http=none',
+            output)
+        self.assertNotIn(MARKER, output)
+        self.assertFalse(f.creates or f.notifications or f.disables)
 
 
 if __name__ == '__main__':
